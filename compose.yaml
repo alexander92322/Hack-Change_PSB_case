@@ -1,0 +1,18 @@
+# Запуск всего проекта:  docker compose up --build
+services:
+  backend:
+    build: .
+    env_file: .env
+    ports:
+      - "${API_PORT:-8000}:8000"
+    volumes:
+      - ./data:/app/data:ro
+    restart: unless-stopped
+
+  # frontend: добавить после инициализации проекта в frontend/ (задача 0.FE.1)
+  # frontend:
+  #   build: ./frontend
+  #   ports:
+  #     - "3000:80"
+  #   depends_on:
+  #     - backend
