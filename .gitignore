@@ -1,0 +1,29 @@
+# Секреты
+.env
+*.env
+!.env.example
+
+# База знаний и вопросы - держим локально в data/, в репозиторий не кладём
+data/*
+!data/.gitkeep
+!data/README.md
+
+# Сборка и артефакты
+submission.csv
+dist/
+*.zip
+__pycache__/
+*.pyc
+.venv/
+venv/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# Фронтенд
+frontend/node_modules/
+frontend/dist/
+
+# IDE
+.idea/
+.vscode/
+.DS_Store
