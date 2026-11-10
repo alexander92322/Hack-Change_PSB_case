@@ -1,10 +1,13 @@
 """Веб-API для чата. Использует то же ядро assistant.answer(), что и solution.py.
 
-Запуск локально:  uvicorn backend.main:app --reload --port 8000
+Запуск локально (из корня проекта):
+    uvicorn backend.main:app --reload --port 8000
+Моки вместо ядра (для фронта): задать переменную окружения MOCK=1.
 """
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -14,6 +17,8 @@ from pydantic import BaseModel
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # корневые модули ядра
 from assistant import answer  # noqa: E402
+from backend import documents  # noqa: E402
+from backend.mocks import mock_answer  # noqa: E402
 
 app = FastAPI(title="Юридический ассистент ПСБ")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -31,29 +36,31 @@ class AskRequest(BaseModel):
 
 @app.get("/health")
 def health() -> dict:
-    return {"status": "ok"}
+    return {"status": "ok", "mock": os.getenv("MOCK", "0") == "1"}
 
 
 @app.post("/ask")
 def ask(req: AskRequest) -> dict:
-    return answer(req.question, [m.model_dump() for m in req.history])
-
-
-# --- Моки до готовности индекса (задача 1.BE.2) ---
-_DEMO_DOC = {
-    "doc_id": "demo",
-    "doc_title": "Демо-документ",
-    "text": "1.1. Здесь будет фрагмент документа, подтверждающий ответ.\n1.2. Остальной текст документа.",
-}
+    history = [m.model_dump() for m in req.history]
+    if os.getenv("MOCK", "0") == "1":
+        return mock_answer(req.question, history)
+    return answer(req.question, history)
 
 
 @app.get("/documents")
 def list_documents() -> list[dict]:
-    return [{"doc_id": _DEMO_DOC["doc_id"], "doc_title": _DEMO_DOC["doc_title"]}]
+    docs = documents.load_documents()
+    if not docs:
+        raise HTTPException(503, "База знаний не найдена: положите knowledge-base.zip в папку data/")
+    return [
+        {k: d[k] for k in ("doc_id", "doc_title", "doc_type", "is_active")}
+        for d in docs
+    ]
 
 
 @app.get("/documents/{doc_id}")
 def get_document(doc_id: str) -> dict:
-    if doc_id != _DEMO_DOC["doc_id"]:
+    doc = documents.get_document(doc_id)
+    if doc is None:
         raise HTTPException(404, "Документ не найден")
-    return _DEMO_DOC
+    return doc
