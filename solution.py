@@ -13,6 +13,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import config
+import kb
 from assistant import answer, split_dialog
 
 FALLBACK = "Не удалось сформировать ответ по базе знаний."
@@ -46,7 +47,12 @@ def clean(text: str) -> str:
 
 def main() -> None:
     questions = load_questions(find_file("questions.csv"))
-    print(f"Вопросов: {len(questions)}; MAX_WORKERS={config.MAX_WORKERS}", flush=True)
+    docs = kb.load_documents()
+    chunks = kb.load_chunks()
+    print(
+        f"Вопросов: {len(questions)}; Документов: {len(docs)}; Чанков: {len(chunks)}; MAX_WORKERS={config.MAX_WORKERS}",
+        flush=True,
+    )
 
     def work(position: int, raw: str) -> tuple[int, str]:
         try:
