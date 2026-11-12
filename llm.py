@@ -39,12 +39,12 @@ def _post(path: str, payload: dict, attempts: int = 5, api_key: str | None = Non
     raise last  # type: ignore[misc]
 
 
-def chat(messages: list[dict]) -> str:
+def chat(messages: list[dict], max_tokens: int | None = None) -> str:
     data = _post("/chat/completions", {
         "model": config.LLM_MODEL,
         "messages": messages,
         "temperature": config.TEMPERATURE,
-        "max_tokens": config.MAX_TOKENS,
+        "max_tokens": max_tokens if max_tokens is not None else config.MAX_TOKENS,
     })
     text = (data["choices"][0]["message"].get("content") or "")
     text = re.sub(r"<think>.*?</think>", "", text, flags=re.S)  # на случай reasoning-модели

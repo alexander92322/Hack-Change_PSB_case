@@ -22,6 +22,10 @@ _ROLE_MARKER = re.compile(
     flags=re.I,
 )
 MAX_EVIDENCE_CHARS = 24000
+MAX_ANSWER_WORDS = 150
+MAX_ANSWER_CHARS = 10000
+MAX_ANSWER_REGENERATIONS = 2
+ANSWER_MAX_TOKENS = 300
 _STOP_WORDS = {
     "а", "без", "бы", "был", "была", "были", "быть", "в", "вам", "вас", "весь", "во",
     "вот", "все", "всего", "всех", "вы", "где", "да", "для", "до", "его", "ее", "если",
@@ -106,7 +110,7 @@ def _parse_generated_result(raw: str) -> tuple[tuple[str, str] | None, str]:
     answer, status = payload.get("answer"), payload.get("status")
     if not isinstance(answer, str) or not answer.strip() or not isinstance(status, str) or status not in _ANSWER_STATUSES:
         return None, "в JSON отсутствует непустой answer или допустимый status"
-    return (_limit_answer(answer), status), ""
+    return ((answer.strip(), status), "")
 
 
 class ModelParseError(ValueError):
@@ -445,7 +449,8 @@ def generate_answer(question: str, hits: list[dict], history: list[dict[str, str
         "refused_illegal для просьбы содействовать незаконному действию. Не возвращай sources: источники будут сформированы кодом. "
         "При отказе верни краткое объяснение в answer "
         "и соответствующий status. Если данных хватает частично, status=partial. При полном ответе status=answered. "
-        "Не более 150 слов и 10000 символов в answer."
+        "Ответ не длиннее 150 слов. Только суть и ссылки на источники. "
+        "Не более 10000 символов в answer."
     )
     history_text = "\n".join(
         f"{'Пользователь' if m['role'] == 'user' else 'Ассистент'}: {m['content']}"
@@ -475,33 +480,82 @@ def generate_answer(question: str, hits: list[dict], history: list[dict[str, str
         {"role": "system", "content": system},
         {"role": "user", "content": user_content},
     ]
-    first_raw = llm.chat(messages).strip()
-    parsed, parse_error = _parse_generated_result(first_raw)
-    if parsed is not None:
+    answer_max_tokens = min(config.MAX_TOKENS, ANSWER_MAX_TOKENS)
+    first_raw = llm.chat(messages, max_tokens=answer_max_tokens).strip()
+    raw = first_raw
+    parsed, parse_error = _parse_generated_result(raw)
+    if parsed is not None and _within_answer_limits(parsed[0]):
         return parsed
-    retry_messages = messages + [
-        {"role": "assistant", "content": first_raw[:6000]},
-        {"role": "user", "content": (
-            "Предыдущий вывод не удалось разобрать. Повтори ответ только как один валидный JSON-объект, "
-            "без Markdown и пояснений, строго с ключами answer и status. "
-            "status должен быть одним из: answered, partial, refused_no_data, refused_offtopic, refused_illegal."
-        )},
-    ]
-    retry_raw = llm.chat(retry_messages).strip()
-    parsed, retry_error = _parse_generated_result(retry_raw)
+    last_error = parse_error
+    for attempt in range(MAX_ANSWER_REGENERATIONS):
+        if parsed is None:
+            correction_reason = f"Предыдущий вывод не удалось разобрать: {last_error}."
+        else:
+            correction_reason = (
+                f"Предыдущий ответ превышает лимит: {len(parsed[0].split())} слов, "
+                f"{len(parsed[0])} символов. Переформулируй его максимум в 140 слов "
+                f"(жёсткий предел — {MAX_ANSWER_WORDS}) "
+                f"и {MAX_ANSWER_CHARS} символов."
+            )
+        retry_messages = messages + [
+            {"role": "assistant", "content": raw[:6000]},
+            {"role": "user", "content": (
+                f"{correction_reason} СФОРМУЛИРУЙ ОТВЕТ ЗАНОВО, не обрезай его. "
+                f"Уложись максимум в {MAX_ANSWER_WORDS} слов и {MAX_ANSWER_CHARS} символов, "
+                "сохрани подтверждённые выводы и ссылки на пункты, не добавляй новых фактов. "
+                "Верни только один валидный JSON-объект без Markdown и пояснений, строго с ключами answer и status. "
+                "status должен быть одним из: answered, partial, refused_no_data, refused_offtopic, refused_illegal."
+            )},
+        ]
+        raw = llm.chat(retry_messages, max_tokens=answer_max_tokens).strip()
+        parsed, last_error = _parse_generated_result(raw)
+        if parsed is not None and _within_answer_limits(parsed[0]):
+            return parsed
+
     if parsed is None:
-        raise ModelParseError(f"первая попытка: {parse_error}; повторная: {retry_error}", first_raw, retry_raw)
-    return parsed
+        raise ModelParseError(
+            f"первая попытка: {parse_error}; последняя повторная: {last_error}", first_raw, raw
+        )
+    # If the model still exceeds the limit, return only whole sentences that fit.
+    shortened = _truncate_at_sentence_boundary(parsed[0])
+    if shortened:
+        return shortened, parsed[1]
+    raise ModelOutputLimitError(
+        f"ответ не уложился в лимит после {MAX_ANSWER_REGENERATIONS} повторных генераций "
+        f"({len(parsed[0].split())} слов, {len(parsed[0])} символов); нет целого предложения в лимите",
+        first_raw,
+        raw,
+    )
 
 
-def _limit_answer(text: str) -> str:
-    text = text.strip()
-    if len(text) > 10000:
-        text = text[:9990].rsplit(" ", 1)[0].rstrip(" ,;:") + "…"
-    words = text.split()
-    if len(words) > 150:
-        text = " ".join(words[:149]).rstrip(" ,;:") + "…"
-    return text or REFUSAL
+def _within_answer_limits(text: str) -> bool:
+    return bool(text.strip()) and len(text) <= MAX_ANSWER_CHARS and len(text.split()) <= MAX_ANSWER_WORDS
+
+
+def _truncate_at_sentence_boundary(text: str) -> str:
+    """Оставляет максимальный префикс из целых предложений в пределах ответа."""
+    abbreviations = {"ст", "п", "ч", "г", "д", "т", "др", "им", "руб", "коп", "см"}
+    best = ""
+    for match in re.finditer(r"[.!?…]+(?:[»”\"')\]]*)?(?=\s|$)", text):
+        end = match.end()
+        prefix = text[:end].rstrip()
+        punctuation_start = match.start()
+        preceding = text[:punctuation_start].rstrip()
+        previous_token = re.search(r"([\wА-Яа-яЁё]+)$", preceding)
+        if previous_token and previous_token.group(1).lower() in abbreviations:
+            continue
+        if not _within_answer_limits(prefix):
+            continue
+        if len(prefix) > len(best):
+            best = prefix
+    return best
+
+
+class ModelOutputLimitError(ValueError):
+    def __init__(self, message: str, first_raw: str, retry_raw: str):
+        super().__init__(message)
+        self.first_raw = first_raw
+        self.retry_raw = retry_raw
 
 
 class LegalAgent:
@@ -559,9 +613,29 @@ class LegalAgent:
                 error_info["retrieval"] = search_diagnostics
             _log_request(question, top_chunk_ids, "parse_error", error_info)
             return {"answer": PROCESSING_ERROR, "status": "partial", "sources": []}
+        except ModelOutputLimitError as exc:
+            _log_request(question, top_chunk_ids, "output_limit_error", {
+                "message": str(exc),
+                "first_raw_model_response": exc.first_raw,
+                "retry_raw_model_response": exc.retry_raw,
+            })
+            return {
+                "answer": "Не удалось сформулировать ответ в пределах 150 слов. Уточните вопрос и попробуйте ещё раз.",
+                "status": "partial",
+                "sources": [],
+            }
         except Exception as exc:
             _log_request(question, top_chunk_ids, "error", f"{type(exc).__name__}: {exc}")
             return {"answer": PROCESSING_ERROR, "status": "partial", "sources": []}
+        # Enforce the platform limit on the actual generated text at the return boundary.
+        # Keep citations/sources in sync with the text that the caller will receive.
+        if not _within_answer_limits(answer_text):
+            _log_request(question, top_chunk_ids, "output_limit_error", "ответ не прошёл проверку длины")
+            return {
+                "answer": "Не удалось сформулировать ответ в пределах 150 слов. Уточните вопрос и попробуйте ещё раз.",
+                "status": "partial",
+                "sources": [],
+            }
         unsupported = _unsupported_citations(answer_text, hits) if status in {"answered", "partial"} else []
         if unsupported:
             _log_request(question, top_chunk_ids, "unsupported_citations", unsupported)
