@@ -23,6 +23,9 @@ def main() -> None:
         for py in sorted(ROOT.glob("*.py")):
             z.write(py, py.name)
         z.write(ROOT / "requirements-submission.txt", "requirements.txt")
+        registry = ROOT / "document_registry.yaml"
+        if registry.is_file():
+            z.write(registry, registry.name)
         index_dir = ROOT / "index"
         if index_dir.is_dir():
             for f in sorted(index_dir.iterdir()):
