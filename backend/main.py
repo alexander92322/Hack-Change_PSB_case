@@ -11,7 +11,7 @@ import os
 import sys
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -41,10 +41,13 @@ def health() -> dict:
 
 @app.post("/ask")
 def ask(req: AskRequest) -> dict:
+    q = req.question.strip()
+    if not q:
+        raise HTTPException(400, "Вопрос не может быть пустым")
     history = [m.model_dump() for m in req.history]
     if os.getenv("MOCK", "0") == "1":
-        return mock_answer(req.question, history)
-    return answer(req.question, history)
+        return mock_answer(q, history)
+    return answer(q, history)
 
 
 @app.get("/documents")
@@ -59,8 +62,31 @@ def list_documents() -> list[dict]:
 
 
 @app.get("/documents/{doc_id}")
-def get_document(doc_id: str) -> dict:
+def get_document(doc_id: str, point: str | None = None) -> dict:
     doc = documents.get_document(doc_id)
     if doc is None:
         raise HTTPException(404, "Документ не найден")
-    return doc
+
+    doc_chunks = [
+        {
+            "chunk_id": c["chunk_id"],
+            "section": c["section"],
+            "point": c["point"],
+            "start_char": c["start_char"],
+            "end_char": c["end_char"],
+        }
+        for c in documents.load_chunks()
+        if c["doc_id"] == doc_id
+    ]
+    result = {**doc, "chunks": doc_chunks}
+    if point:
+        result["highlight"] = documents.find_chunk_position(doc_id, point=point)
+    return result
+
+
+@app.get("/chunks/{chunk_id}")
+def get_chunk(chunk_id: str) -> dict:
+    chunk = documents.get_chunk(chunk_id)
+    if chunk is None:
+        raise HTTPException(404, "Фрагмент (чанк) не найден")
+    return chunk
