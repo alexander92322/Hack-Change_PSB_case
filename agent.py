@@ -25,8 +25,8 @@ _ROLE_MARKER = re.compile(
 MAX_EVIDENCE_CHARS = 24000
 MAX_ANSWER_WORDS = 150
 MAX_ANSWER_CHARS = 10000
-MAX_ANSWER_REGENERATIONS = 2
-ANSWER_MAX_TOKENS = 300
+MAX_ANSWER_REGENERATIONS = 1   # один повтор: экономим время прогона
+ANSWER_MAX_TOKENS = 1024        # 300 токенов обрезали JSON с русским ответом на полуслове
 _STOP_WORDS = {
     "а", "без", "бы", "был", "была", "были", "быть", "в", "вам", "вас", "весь", "во",
     "вот", "все", "всего", "всех", "вы", "где", "да", "для", "до", "его", "ее", "если",
@@ -345,6 +345,33 @@ def _sources_for_answer(answer_text: str, hits: list[dict]) -> list[dict]:
     return result
 
 
+def _fallback_sources(answer_text: str, hits: list[dict], limit: int = 3) -> list[dict]:
+    """Источники без дословного названия документа в ответе: сначала фрагменты, чьи пункты упомянуты в ответе."""
+    answer_norm = kb.norm(answer_text)
+    scored = []
+    for rank, hit in enumerate(hits):
+        chunk = hit["chunk"]
+        label = chunk.get("label") or (f"ст. {chunk['article']}" if chunk.get("article") else "")
+        refs = re.findall(r"(?:ст\.|п\.|подп\.|ч\.)\s*\d+(?:\.\d+)*", kb.norm(label))
+        mentioned = any(ref in answer_norm for ref in refs)
+        scored.append((0 if mentioned else 1, rank, hit, label))
+    if any(flag == 0 for flag, *_ in scored):
+        scored = [item for item in scored if item[0] == 0]  # есть упомянутые пункты - только они
+    result, seen = [], set()
+    for _, _, hit, label in sorted(scored, key=lambda x: (x[0], x[1])):
+        doc, chunk = hit["doc"], hit["chunk"]
+        key = (doc["file"], label)
+        if key in seen:
+            continue
+        seen.add(key)
+        doc_id, title = docs_kb.doc_ref_for_file(doc["file"])
+        result.append({"doc_id": doc_id, "doc_title": title or str(doc.get("title") or doc["file"]),
+                       "point": str(label), "text": str(chunk.get("text", "")), "score": float(hit.get("score", 0.0))})
+        if len(result) >= limit:
+            break
+    return result
+
+
 def _unsupported_citations(answer_text: str, hits: list[dict]) -> list[str]:
     """Находит ссылки на статьи и пункты, которых нет среди найденных фрагментов."""
     answer_norm = kb.norm(answer_text)
@@ -357,6 +384,11 @@ def _unsupported_citations(answer_text: str, hits: list[dict]) -> list[str]:
     for hit in hits:
         label = kb.norm(hit["chunk"].get("label", ""))
         supported_points.update(re.findall(r"\bп\.?\s*(\d+(?:\.\d+)*)", label))
+        text = kb.norm(hit["chunk"].get("text", ""))
+        # нумерация пунктов внутри фрагмента («3.2. ...») и явные ссылки «п. 2.4» в его тексте
+        supported_points.update(re.findall(r"(?:^|\s)(\d+(?:\.\d+)+)\.?\s", text))
+        supported_points.update(re.findall(r"\bп\.?\s*(\d+(?:\.\d+)*)", text))
+        supported_articles.update(re.findall(r"\bст(?:атья|\.)?\s*(\d+(?:\.\d+)*)", text))
     missing = [f"ст. {value}" for value in sorted(articles - supported_articles)]
     missing.extend(f"п. {value}" for value in sorted(points - supported_points))
     return missing
@@ -438,8 +470,11 @@ def generate_answer(question: str, hits: list[dict], history: list[dict[str, str
         "Если вопрос просит перечень, перечисли найденные пункты целиком, когда весь перечень есть в контексте. "
         "Отвечай только на запрошенный аспект и не добавляй смежные условия без необходимости. "
         "Если база подтверждает только часть ответа — ответь только на подтверждённую часть и прямо укажи, каких сведений не хватает. "
-        "Полностью откажись, если вопрос не относится к правовой тематике, в базе нет релевантных подтверждений "
-        "или запрос просит помочь совершить незаконное действие. Не добавляй догадки и не предлагай инструкции по обходу закона. "
+        "Если в выдержках есть хотя бы частично относящиеся к вопросу сведения, обязательно ответь по ним "
+        "(status=partial) и прямо назови, каких сведений не хватает, — это лучше полного отказа. "
+        "Полностью откажись только если вопрос не относится к правовой тематике, в выдержках нет ничего относящегося к вопросу, "
+        "или запрос просит помочь совершить незаконное действие. Если в вопросе неверная предпосылка (сумма, дата, номер), "
+        "поправь её по документу со ссылкой. Не добавляй догадки и не предлагай инструкции по обходу закона. "
         "Выбирай редакцию и условия по дате события, учитывай дополнительные соглашения и их даты применения. "
         "Если для выбора документа не хватает реквизитов, не угадывай. "
         "Тебе нужно вернуть служебный JSON-объект ровно с ключами answer и status. "
@@ -515,6 +550,9 @@ def generate_answer(question: str, hits: list[dict], history: list[dict[str, str
             return parsed
 
     if parsed is None:
+        salvaged = _salvage_answer(raw) or _salvage_answer(first_raw)
+        if salvaged is not None:
+            return salvaged
         raise ModelParseError(
             f"первая попытка: {parse_error}; последняя повторная: {last_error}", first_raw, raw
         )
@@ -528,6 +566,71 @@ def generate_answer(question: str, hits: list[dict], history: list[dict[str, str
         first_raw,
         raw,
     )
+
+
+_ABBREVIATIONS = {"ст", "п", "ч", "г", "д", "т", "др", "им", "руб", "коп", "см", "подп", "пп", "абз", "№"}
+
+
+def _split_sentences(text: str) -> list[str]:
+    """Делит ответ на предложения, не разрывая «ст. 70», «п. 3.1», «руб.»."""
+    parts, start = [], 0
+    for m in re.finditer(r"[.!?…]+[»”\"')\]]*\s+(?=[А-ЯЁA-Z«(\d])", text):
+        before = text[start:m.start()].rstrip()
+        prev = re.search(r"([\wА-Яа-яЁё№]+)$", before)
+        if prev and prev.group(1).lower() in _ABBREVIATIONS:
+            continue
+        parts.append(text[start:m.end()].strip())
+        start = m.end()
+    tail = text[start:].strip()
+    if tail:
+        parts.append(tail)
+    return [p for p in parts if p]
+
+
+def _drop_unsupported_sentences(answer_text: str, hits: list[dict]) -> str:
+    """Убирает только предложения с неподтверждёнными ссылками; остальное сохраняет."""
+    kept = [s for s in _split_sentences(answer_text) if not _unsupported_citations(s, hits)]
+    return " ".join(kept).strip()
+
+
+def _salvage_answer(raw: str) -> tuple[str, str] | None:
+    """Достаёт ответ из обрезанного JSON или из обычного текста, если модель не вернула JSON."""
+    text = re.sub(r"^\s*```(?:json)?\s*|\s*```\s*$", "", raw or "", flags=re.I).strip()
+    if not text:
+        return None
+    status_match = re.search(r'"status"\s*:\s*"(\w+)"', text)
+    status = status_match.group(1) if status_match and status_match.group(1) in _ANSWER_STATUSES else ""
+    answer_match = re.search(r'"answer"\s*:\s*"((?:[^"\\]|\\.)*)', text, re.S)
+    if answer_match:
+        body = answer_match.group(1)
+        try:
+            answer = json.loads('"' + body + '"')
+        except json.JSONDecodeError:
+            answer = body.replace('\\n', ' ').replace('\\"', '"')
+    elif "{" not in text:
+        answer = text  # модель ответила обычным текстом
+    else:
+        return None
+    answer = " ".join(answer.split())
+    if not answer:
+        return None
+    json_cut = bool(answer_match) and not text[answer_match.end():].lstrip().startswith('"')
+    if json_cut:
+        # JSON оборван на середине ответа: последнее предложение недописано - отбрасываем его
+        sentences = _split_sentences(answer)
+        if len(sentences) > 1:
+            answer = " ".join(sentences[:-1])
+    if not _within_answer_limits(answer) or (answer_match and not status_match):
+        # обрезанный ответ: оставляем только целые предложения
+        answer = _truncate_at_sentence_boundary(answer) or answer
+        if not _within_answer_limits(answer):
+            return None
+    if not status:
+        lowered = answer.lower()
+        status = "refused_no_data" if any(
+            m in lowered for m in ("нет сведений", "нет информации", "нет данных", "не содержит", "не могу ответить")
+        ) else "partial"
+    return answer, status
 
 
 def _within_answer_limits(text: str) -> bool:
@@ -643,19 +746,16 @@ class LegalAgent:
         unsupported = _unsupported_citations(answer_text, hits) if status in {"answered", "partial"} else []
         if unsupported:
             _log_request(question, top_chunk_ids, "unsupported_citations", unsupported)
-            return {
-                "answer": "В ответе появились ссылки, которых нет среди найденных выдержек. Не могу подтвердить его по базе.",
-                "status": "partial",
-                "sources": [],
-            }
+            trimmed = _drop_unsupported_sentences(answer_text, hits)
+            if trimmed and re.search(r"\b(?:ст|п)\.?\s*\d", kb.norm(trimmed)):
+                answer_text = trimmed
+                status = "partial" if status == "answered" else status
+            else:
+                return {"answer": REFUSAL, "status": "refused_no_data", "sources": []}
         sources = _sources_for_answer(answer_text, hits) if status in {"answered", "partial"} else []
         if status in {"answered", "partial"} and not sources:
             _log_request(question, top_chunk_ids, "missing_sources", search_diagnostics or None)
-            return {
-                "answer": "Не удалось подтвердить ответ ссылкой на фрагмент базы знаний. Уточните вопрос и попробуйте ещё раз.",
-                "status": "partial",
-                "sources": [],
-            }
+            sources = _fallback_sources(answer_text, hits)
         _log_request(question, top_chunk_ids, "model_refusal" if status.startswith("refused_") else "ok",
                      search_diagnostics or None)
         return {"answer": answer_text, "status": status, "sources": sources}
