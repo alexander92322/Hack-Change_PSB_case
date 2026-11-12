@@ -58,7 +58,8 @@ def read_zip(path) -> list[tuple[str, str]]:
                     continue
             else:
                 text = raw.decode("utf-8", "replace")
-            out.append((Path(name).name, clean(text)))
+            # NFC: архивы, перепакованные на macOS, хранят имена в NFD («й» = «и» + знак) - иначе меняется kb_sha
+            out.append((unicodedata.normalize("NFC", Path(name).name), clean(text)))
     return out
 
 

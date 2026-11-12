@@ -11,7 +11,8 @@ import numpy as np
 from rank_bm25 import BM25Okapi
 
 import config
-import kb
+import rag_kb as kb  # индекс и поиск агента
+import kb as docs_kb  # база документов бэкенда: doc_id для /documents и путь к архиву
 import llm
 
 REFUSAL = "В базе знаний нет достаточных сведений для подтверждённого ответа."
@@ -333,9 +334,10 @@ def _sources_for_answer(answer_text: str, hits: list[dict]) -> list[dict]:
         if key in seen:
             continue
         seen.add(key)
+        backend_doc_id, backend_title = docs_kb.doc_ref_for_file(doc["file"])
         result.append({
-            "doc_id": str(doc.get("registry_id") or doc["file"]),
-            "doc_title": str(doc.get("title") or doc["file"]),
+            "doc_id": backend_doc_id,
+            "doc_title": backend_title or str(doc.get("title") or doc["file"]),
             "point": str(label),
             "text": str(chunk.get("text", "")),
             "score": float(hit.get("score", 0.0)),
@@ -561,7 +563,9 @@ class ModelOutputLimitError(ValueError):
 class LegalAgent:
     """Индекс загружается один раз; каждый ask обрабатывается независимо от остальных."""
     def __init__(self, index=None):
-        self.meta, self.vectors = index or kb.ensure_index(config.DATA_DIR / "knowledge-base.zip")
+        self.meta, self.vectors = index or kb.ensure_index(
+            docs_kb.zip_path() or config.DATA_DIR / "knowledge-base.zip"
+        )
         self.typical_answers = _load_typical_answers()
 
     def answer(self, question: str, history=None) -> dict:
