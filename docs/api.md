@@ -38,3 +38,5 @@
 | POST | `/ask` | `{"question": str, "history": [...]}` -> выход ядра |
 | GET | `/documents` | Список документов |
 | GET | `/documents/{doc_id}` | Текст документа (для просмотра и подсветки фрагмента) |
+| GET | `/documents/{doc_id}` | Текст документа, список его структурных чанков (`chunks`) и подсветка (`?point=п. 3.1` -> `highlight`) |
+| GET | `/chunks/{chunk_id}` | Конкретный фрагмент документа с разделом (`section`), пунктом (`point`) и координатами (`start_char`, `end_char`) |
