@@ -9,6 +9,8 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+ROOT = Path(__file__).resolve().parent
+
 try:  # локально удобно держать значения в .env; на платформе файла нет
     from dotenv import load_dotenv
 
@@ -41,6 +43,10 @@ def env_float(name: str, default: float, low: float = 0.0, high: float = 2.0) ->
 
 
 DATA_DIR = Path(env("DATA_DIR", default="data"))
+
+# Локальный офлайн-путь используется только при явной настройке; сабмит работает через API.
+EMB_BACKEND = env("EMB_BACKEND", default="api")
+LOCAL_EMB_PATH = env("LOCAL_EMB_PATH")
 
 API_BASE = env("LLM_BASE_URL", "BASE_URL", "OPENAI_BASE_URL").rstrip("/")
 LLM_KEY = env("LLM_API_KEY", "OPENAI_API_KEY")

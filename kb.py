@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import re
+import unicodedata
 import zipfile
 from functools import lru_cache
 from pathlib import Path
@@ -162,6 +163,13 @@ def parse_document_chunks(doc: dict) -> list[dict]:
     return chunks
 
 
+def doc_ref_for_file(filename: str) -> tuple[str, str]:
+    """(doc_id, doc_title) по имени файла из архива. Единый источник id для /documents и ответов агента."""
+    stem = unicodedata.normalize("NFC", Path(filename).stem)
+    title = stem.split("__", 1)[-1].replace("_действующая", "").replace("_", " ").strip()
+    return _slug(title), title
+
+
 @lru_cache(maxsize=1)
 def load_documents() -> list[dict]:
     path = zip_path()
@@ -174,10 +182,10 @@ def load_documents() -> list[dict]:
                 continue
             raw = zf.read(name)
             text = raw.decode("utf-8-sig", errors="replace").replace("\r\n", "\n")
-            stem = Path(name).stem
-            title = stem.split("__", 1)[-1].replace("_действующая", "").replace("_", " ").strip()
+            stem = unicodedata.normalize("NFC", Path(name).stem)
+            doc_id, title = doc_ref_for_file(name)
             docs.append({
-                "doc_id": _slug(title),
+                "doc_id": doc_id,
                 "doc_title": title,
                 "doc_type": _doc_type(stem),
                 "is_active": "утратил силу" not in stem.lower(),
