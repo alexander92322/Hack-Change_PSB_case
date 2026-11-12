@@ -1,3 +1,5 @@
+import html
+
 import reflex as rx
 from typing import List
 from pydantic import BaseModel
@@ -6,6 +8,29 @@ import os
 
 # Читаем адрес бэкенда из env (для Docker), по умолчанию localhost:8000
 API_URL = os.getenv("BACKEND_URL", "http://localhost:8000")
+ASK_TIMEOUT = 60.0  # ответ с поиском и LLM может идти дольше 30 секунд
+
+EXAMPLE_QUESTIONS = [
+    "Какая арендная плата по договору с ООО «Северный Склад» и до какого числа её вносить?",
+    "Какой максимальный срок испытания можно установить главному бухгалтеру?",
+    "Договор на 12 млн рублей заключали в августе 2024 года. Нужно ли было одобрение генерального директора?",
+]
+
+
+def build_highlighted_html(text: str, fragment: str) -> str:
+    """Экранирует текст документа и оборачивает первое вхождение фрагмента в <mark id="hl">."""
+    safe_text = html.escape(text)
+    frag = (fragment or "").strip()
+    if frag:
+        safe_frag = html.escape(frag)
+        if safe_frag in safe_text:
+            return safe_text.replace(
+                safe_frag,
+                '<mark id="hl" style="background-color:#FEF7E0;padding:2px;border-radius:4px;">'
+                + safe_frag + "</mark>",
+                1,
+            )
+    return safe_text
 
 # --- Типизация данных ---
 class Source(BaseModel):
@@ -31,12 +56,22 @@ class State(rx.State):
     is_panel_open: bool = False
     selected_doc_title: str = ""
     selected_doc_text: str = ""
+    selected_doc_html: str = ""
     highlight_text: str = ""
     is_doc_active: bool = True
     is_doc_loading: bool = False
 
     def set_question(self, val: str):
         self.question = val
+
+    def ask_example(self, val: str):
+        self.question = val
+        return State.send_message
+
+    def new_chat(self):
+        self.messages = []
+        self.question = ""
+        self.is_panel_open = False
 
     async def send_message(self):
         q = self.question.strip()
@@ -55,7 +90,7 @@ class State(rx.State):
                 response = await client.post(
                     f"{API_URL}/ask",
                     json={"question": q, "history": history},
-                    timeout=30.0
+                    timeout=ASK_TIMEOUT
                 )
                 response.raise_for_status()
                 data = response.json()
@@ -69,9 +104,10 @@ class State(rx.State):
                 sources=sources
             ))
         except Exception as e:
+            print(f"[frontend] /ask error: {e!r}")
             self.messages.append(ChatMessage(
                 role="assistant",
-                content=f"Ошибка при соединении с сервером: {str(e)}",
+                content="Не удалось получить ответ от сервера. Попробуйте отправить вопрос ещё раз.",
                 status="error",
                 sources=[]
             ))
@@ -88,6 +124,7 @@ class State(rx.State):
         self.is_doc_loading = True
         self.highlight_text = highlight
         self.selected_doc_text = ""
+        self.selected_doc_html = ""
         self.selected_doc_title = "Загрузка..."
         yield
 
@@ -98,15 +135,18 @@ class State(rx.State):
                     data = response.json()
                     self.selected_doc_title = data.get("doc_title", "Документ")
                     self.selected_doc_text = data.get("text", "")
+                    self.selected_doc_html = build_highlighted_html(self.selected_doc_text, highlight)
                     self.is_doc_active = data.get("is_active", True)
                 else:
                     self.selected_doc_title = "Ошибка 404"
-                    self.selected_doc_text = "Документ не найден в базе."
+                    self.selected_doc_html = "Документ не найден в базе."
         except Exception as e:
+            print(f"[frontend] /documents error: {e!r}")
             self.selected_doc_title = "Ошибка"
-            self.selected_doc_text = str(e)
+            self.selected_doc_html = "Не удалось загрузить документ. Попробуйте ещё раз."
         finally:
             self.is_doc_loading = False
+        yield rx.scroll_to("hl")
 
     def close_panel(self):
         self.is_panel_open = False
@@ -135,15 +175,11 @@ def sidebar() -> rx.Component:
         ),
         rx.vstack(
             rx.hstack(rx.icon(tag="message-square", size=18), rx.text("Чат"), padding="10px", border_radius="8px", background_color="#F2F3F5", width="100%", color="#1A1A1A", font_weight="500"),
-            rx.hstack(rx.icon(tag="clock", size=18), rx.text("История"), padding="10px", width="100%", color="#666"),
-            rx.hstack(rx.icon(tag="star", size=18), rx.text("Избранное"), padding="10px", width="100%", color="#666"),
-            rx.hstack(rx.icon(tag="settings", size=18), rx.text("Настройки"), padding="10px", width="100%", color="#666"),
             spacing="2",
             width="100%",
             padding="10px",
         ),
         rx.spacer(),
-        rx.hstack(rx.icon(tag="info", size=18), rx.text("Помощь"), padding="10px", width="100%", color="#666"),
         width="250px",
         height="100vh",
         background_color="#FFFFFF",
@@ -200,8 +236,13 @@ def message_bubble(msg: ChatMessage) -> rx.Component:
 def chat_area() -> rx.Component:
     return rx.vstack(
         rx.hstack(
-            rx.icon(tag="arrow-left", size=20, color="#666", cursor="pointer"),
-            rx.text("Новый чат", font_size="16px", font_weight="500", color="#1A1A1A"),
+            rx.text("Юридический ассистент", font_size="16px", font_weight="500", color="#1A1A1A"),
+            rx.spacer(),
+            rx.button(
+                rx.icon(tag="plus", size=16), "Новый чат",
+                variant="outline", color="#1A1A1A", background_color="#FFFFFF",
+                border_radius="8px", cursor="pointer", on_click=State.new_chat,
+            ),
             width="100%",
             padding="20px",
             border_bottom="1px solid #E2E8F0",
@@ -213,11 +254,19 @@ def chat_area() -> rx.Component:
                 rx.vstack(
                     rx.text("Юридический ассистент", font_size="32px", font_weight="bold", margin_bottom="10px", color="#1A1A1A"),
                     rx.text("Надёжный помощник для работы с нормативными документами", color="#666", margin_bottom="30px"),
-                    rx.hstack(
-                        rx.button("НДС при экспорте", variant="outline", border_radius="20px", color="#1A1A1A", background_color="#FFFFFF", on_click=State.set_question("НДС при экспорте")),
-                        rx.button("Условия договора", variant="outline", border_radius="20px", color="#1A1A1A", background_color="#FFFFFF", on_click=State.set_question("Условия договора")),
-                        rx.button("Изменения в 2025 году", variant="outline", border_radius="20px", color="#1A1A1A", background_color="#FFFFFF", on_click=State.set_question("Изменения в 2025 году")),
-                        spacing="3",
+                    rx.text("Например:", font_size="14px", color="#666"),
+                    rx.vstack(
+                        *[
+                            rx.button(
+                                q, variant="outline", border_radius="20px", color="#1A1A1A",
+                                background_color="#FFFFFF", white_space="normal", height="auto",
+                                padding="8px 16px", text_align="left", cursor="pointer",
+                                on_click=State.ask_example(q),
+                            )
+                            for q in EXAMPLE_QUESTIONS
+                        ],
+                        spacing="2",
+                        align_items="start",
                     ),
                     align_items="start",
                     width="100%",
@@ -303,15 +352,10 @@ def document_panel() -> rx.Component:
                     rx.cond(
                         State.is_doc_loading,
                         rx.center(rx.spinner(size="3"), width="100%", height="100%"),
-                        rx.html(
-                            State.selected_doc_text.replace(
-                                State.highlight_text,
-                                "<mark style='background-color: #FEF7E0; padding: 2px; border-radius: 4px;'>" + State.highlight_text + "</mark>"
-                            )
-                        )
+                        rx.html(State.selected_doc_html)
                     ),
                     padding="30px", overflow_y="auto", width="100%", height="calc(100vh - 70px)",
-                    font_size="15px", line_height="1.6", color="#333"
+                    font_size="15px", line_height="1.6", color="#333", white_space="pre-wrap"
                 ),
                 position="fixed", top="0", right="0", width="50vw", min_width="400px", height="100vh",
                 background_color="white", z_index="1000",
