@@ -2,7 +2,7 @@
 
 Проверяет, что все упоминания статей, пунктов и номеров договоров в тексте ответа
 действительно присутствуют в переданных найденных фрагментах (sources).
-Защищает от галлюцинаций, за которые обнуляется балл на проверке.
+Корректно сопоставляет номера договоров через слэш (А-08/2024) и дефис (А-08-2024).
 """
 
 from __future__ import annotations
@@ -10,25 +10,39 @@ from __future__ import annotations
 import re
 from typing import Any
 
-# Вытаскивает упоминания статей: "ст. 164", "статьи 284.1", "ст 13.11"
+import kb
+
+# Вытаскивает упоминания статей: "ст. 164", "статьи 284.1", "ст 13.11", "ст9"
 _ARTICLE_RE = re.compile(r"\bст(?:ать[еиюяь]|атья)?\.?\s*(\d+(?:\.\d+)?)", re.IGNORECASE)
 
 # Вытаскивает упоминания пунктов: "п. 3.1", "пункта 7.4", "подп. 2", "пп. 1.2"
 _POINT_RE = re.compile(r"\b(?:под)?п(?:ункт[ауеом]?|п)?\.?\s*(\d+(?:\.\d+)*)", re.IGNORECASE)
 
-# Вытаскивает номера договоров/документов: "№ П-17/2024", "ПТ-05/2023", "А-08/2024"
-_DOC_NUM_RE = re.compile(r"\b([А-ЯЁA-Z]{1,4}-\d{1,4}/\d{2,4})\b")
+# Вытаскивает номера договоров и со слэшем (А-08/2024), и с дефисом (А-08-2024)
+_DOC_NUM_RE = re.compile(
+    r"\b([А-ЯЁA-Z]{1,4})\s*-\s*(\d{1,4})\s*[/\\-]\s*(20\d{2}|\d{2})\b",
+    re.IGNORECASE,
+)
+
+# Перевод латинских букв-двойников в кириллицу (если модель написала A-08 латинской A)
+_LAT_TO_CYR = str.maketrans("ABCEHKMOPTXY", "АВСЕНКМОРТХУ")
 
 
-def _normalize_doc_num(num: str) -> str:
-    return num.upper().replace("\\", "/").strip()
+def _normalize_doc_num(prefix: str, num: str, year: str) -> str:
+    """Приводит номер договора к единому виду: 'А-08-2024' и 'A-08/2024' -> 'А-08/2024'."""
+    clean_prefix = prefix.upper().translate(_LAT_TO_CYR)
+    clean_num = num.lstrip("0") or "0"
+    return f"{clean_prefix}-{clean_num}/{year}"
 
 
 def extract_citations(text: str) -> dict[str, set[str]]:
-    """Извлекает из текста все юридические ссылки: статьи, пункты и номера договоров."""
+    """Извлекает из текста все юридические ссылки: статьи, пункты и нормализованные номера договоров."""
     articles = {m.group(1) for m in _ARTICLE_RE.finditer(text)}
     points = {m.group(1) for m in _POINT_RE.finditer(text)}
-    doc_nums = {_normalize_doc_num(m.group(1)) for m in _DOC_NUM_RE.finditer(text)}
+    doc_nums = {
+        _normalize_doc_num(m.group(1), m.group(2), m.group(3))
+        for m in _DOC_NUM_RE.finditer(text)
+    }
     return {
         "articles": articles,
         "points": points,
@@ -41,17 +55,7 @@ def verify_answer(
     status: str,
     sources: list[dict[str, Any]],
 ) -> dict[str, Any]:
-    """Проверяет ответ на соответствие найденным фрагментам (sources).
-
-    Возвращает словарь:
-    {
-        "is_valid": bool,               # True, если все ссылки подтверждены фрагментами
-        "answer": str,                  # проверенный (или скорректированный) текст ответа
-        "status": str,                  # проверенный (или скорректированный) статус
-        "unverified_citations": list[str],  # список неподтверждённых ссылок (если нашлись)
-    }
-    """
-    # Если бот уже отказался отвечать, проверять ссылки на источники не требуется
+    """Проверяет ответ на соответствие найденным фрагментам (sources)."""
     if status in {"refused_no_data", "refused_offtopic", "refused_illegal"}:
         return {
             "is_valid": True,
@@ -63,7 +67,6 @@ def verify_answer(
     citations = extract_citations(answer_text)
     has_any_citation = any(citations.values())
 
-    # Если источников вообще нет, а бот пытается утверждать что-то со ссылками на законы/договоры
     if not sources:
         if has_any_citation:
             return {
@@ -83,15 +86,24 @@ def verify_answer(
             "unverified_citations": [],
         }
 
-    # Собираем единый корпус текста из всех найденных фрагментов (заголовки + пункты + текст)
-    allowed_blob = "\n".join(
-        f"{s.get('doc_title', '')} {s.get('section', '')} {s.get('point', '')} {s.get('text', '')}"
-        for s in sources
-    )
+    # Собираем текст из всех переданных фрагментов + преамбул этих документов из базы (по doc_id)
+    parts: list[str] = []
+    seen_docs: set[str] = set()
+    for s in sources:
+        doc_id = s.get("doc_id", "")
+        parts.append(
+            f"{doc_id} {s.get('doc_title', '')} {s.get('section', '')} {s.get('point', '')} {s.get('text', '')}"
+        )
+        if doc_id and doc_id not in seen_docs:
+            seen_docs.add(doc_id)
+            full_doc = kb.get_document(doc_id)
+            if full_doc:
+                # Добавляем заголовок и первые 600 символов (преамбулу) документа, где указаны номер и дата
+                parts.append(f"{full_doc['doc_title']} {full_doc['text'][:600]}")
+
+    allowed_blob = "\n".join(parts)
     allowed_citations = extract_citations(allowed_blob)
-    # Также допускаем, что номер пункта/статьи встречается в тексте источника как обычное число
     allowed_numbers = set(re.findall(r"\b\d+(?:\.\d+)*\b", allowed_blob))
-    allowed_blob_upper = allowed_blob.upper().replace("\\", "/")
 
     unverified: list[str] = []
 
@@ -104,7 +116,7 @@ def verify_answer(
             unverified.append(f"п. {pt}")
 
     for dnum in sorted(citations["doc_nums"]):
-        if dnum not in allowed_citations["doc_nums"] and dnum not in allowed_blob_upper:
+        if dnum not in allowed_citations["doc_nums"]:
             unverified.append(f"документ {dnum}")
 
     if not unverified:
@@ -115,7 +127,6 @@ def verify_answer(
             "unverified_citations": [],
         }
 
-    # Если найдены неподтвержденные ссылки — понижаем статус до partial и добавляем честную оговорку
     new_status = "partial" if status == "answered" else status
     warning = (
         f" (Примечание: ссылки на {', '.join(unverified)} не подтверждены "
