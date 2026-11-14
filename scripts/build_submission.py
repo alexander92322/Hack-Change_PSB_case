@@ -3,6 +3,7 @@
 В архив попадают:
   - корневые .py-модули ядра (solution.py, config.py, assistant.py и др.);
   - requirements-submission.txt под именем requirements.txt;
+  - document_registry.yaml и typical_answers.csv (образцы формы ответа);
   - файлы готового индекса из папки index/ (кладутся в корень архива).
 Запуск:  python scripts/build_submission.py   ->  dist/submission.zip
 """
@@ -23,9 +24,10 @@ def main() -> None:
         for py in sorted(ROOT.glob("*.py")):
             z.write(py, py.name)
         z.write(ROOT / "requirements-submission.txt", "requirements.txt")
-        registry = ROOT / "document_registry.yaml"
-        if registry.is_file():
-            z.write(registry, registry.name)
+        for extra in ("document_registry.yaml", "typical_answers.csv"):
+            path = ROOT / extra
+            if path.is_file():
+                z.write(path, path.name)
         index_dir = ROOT / "index"
         if index_dir.is_dir():
             for f in sorted(index_dir.iterdir()):
