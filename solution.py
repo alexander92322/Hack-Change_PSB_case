@@ -2,22 +2,24 @@
 
 Читает DATA_DIR/questions.csv (id,question), отвечает через assistant.answer()
 и пишет submission.csv (id,answer) в рабочий каталог.
-Вся логика ответа - в assistant.py; здесь только ввод/вывод и параллельность.
+Вся логика ответа - в agent.py; здесь только ввод/вывод, дедлайн и параллельность.
 """
 
 from __future__ import annotations
 
 import csv
 import sys
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import config
-import kb
-from assistant import answer, split_dialog
+from assistant import answer, split_dialog, warmup
 
-FALLBACK = "Не удалось сформировать ответ по базе знаний."
+FALLBACK = "Не удалось сформировать ответ по базе знаний. Уточните, пожалуйста, вопрос."
+TIMEOUT_FALLBACK = "Не удалось обработать вопрос в отведённое время. Уточните, пожалуйста, вопрос."
 MAX_ANSWER_CHARS = 10_000
+RUN_LIMIT_SECONDS = 17 * 60  # платформа даёт 20 минут; оставляем запас на запись CSV
 
 
 def find_file(*names: str) -> Path:
@@ -34,27 +36,33 @@ def load_questions(path: Path) -> list[tuple[str, str]]:
         reader = csv.DictReader(f)
         if not reader.fieldnames or not {"id", "question"}.issubset(reader.fieldnames):
             raise ValueError("В questions.csv нужны колонки id и question")
-        rows = [(str(r["id"]).strip(), str(r["question"]).strip()) for r in reader]
+        rows = [(str(r["id"]).strip(), str(r.get("question") or "").strip()) for r in reader]
     if not rows or any(not qid for qid, _ in rows):
         raise ValueError("В questions.csv отсутствуют вопросы или id")
     return rows
 
 
-def clean(text: str) -> str:
+def clean(text: str, fallback: str = FALLBACK) -> str:
     text = " ".join((text or "").split())  # одна физическая строка
-    return (text or FALLBACK)[:MAX_ANSWER_CHARS]
+    return (text or fallback)[:MAX_ANSWER_CHARS]
 
 
 def main() -> None:
+    started = time.monotonic()
+    deadline = started + RUN_LIMIT_SECONDS
     questions = load_questions(find_file("questions.csv"))
-    docs = kb.load_documents()
-    chunks = kb.load_chunks()
+    agent = warmup()
+    meta = getattr(agent, "meta", {}) or {}
     print(
-        f"Вопросов: {len(questions)}; Документов: {len(docs)}; Чанков: {len(chunks)}; MAX_WORKERS={config.MAX_WORKERS}",
+        f"Вопросов: {len(questions)}; Документов: {len(meta.get('docs', []))}; "
+        f"Чанков: {len(meta.get('chunks', []))}; MAX_WORKERS={config.MAX_WORKERS}; "
+        f"дедлайн={RUN_LIMIT_SECONDS // 60} мин",
         flush=True,
     )
 
     def work(position: int, raw: str) -> tuple[int, str]:
+        if time.monotonic() >= deadline:
+            return position, TIMEOUT_FALLBACK
         try:
             question, history = split_dialog(raw)
             return position, clean(answer(question, history)["answer"])
@@ -76,7 +84,10 @@ def main() -> None:
         writer.writerow(["id", "answer"])
         for i, (qid, _) in enumerate(questions):
             writer.writerow([qid, answers[i]])
-    print(f"Создан submission.csv: {len(questions)} ответов", flush=True)
+    print(
+        f"Создан submission.csv: {len(questions)} ответов за {time.monotonic() - started:.0f} с",
+        flush=True,
+    )
 
 
 if __name__ == "__main__":

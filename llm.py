@@ -10,15 +10,18 @@ import numpy as np
 import config
 
 _RETRY_STATUS = {429, 500, 502, 503, 504}
-_client = httpx.Client(timeout=httpx.Timeout(120.0, connect=15.0),
+_client = httpx.Client(timeout=httpx.Timeout(config.HTTP_TIMEOUT, connect=15.0),
                        limits=httpx.Limits(max_connections=64))
 
 
-def _post(path: str, payload: dict, attempts: int = 5, api_key: str | None = None) -> dict:
+def _post(path: str, payload: dict, attempts: int | None = None,
+          api_key: str | None = None) -> dict:
     if not config.API_BASE:
         raise RuntimeError("LLM_BASE_URL не задан")
     url = f"{config.API_BASE}{path}"
-    headers = {"Authorization": f"Bearer {api_key or config.LLM_KEY}"}
+    key = api_key or config.LLM_KEY
+    headers = {"Authorization": f"Bearer {key}"} if key else {}
+    attempts = max(1, attempts if attempts is not None else config.RETRIES + 1)
     last: Exception | None = None
     for i in range(attempts):
         wait = min(2 ** i, 20) + random.random()

@@ -15,7 +15,7 @@ import config
 MAX_CHARS = 1400          # максимум символов в чанке, кроме длинных неделимых предложений
 HEAD_CHARS = 350          # «начало документа» для справки модели (редакция, даты, стороны)
 ALIAS_SCAN_CHARS = 4000   # где искать номера договоров и названия организаций
-INDEX_SCHEMA_VERSION = 4
+INDEX_SCHEMA_VERSION = 6
 _INDEX_DIR = config.ROOT / "index"
 # В репозитории индекс хранится в index/; build_submission.py кладёт его файлы в корень ZIP.
 _INDEX_ROOT = _INDEX_DIR if _INDEX_DIR.is_dir() else config.ROOT
@@ -47,7 +47,7 @@ def read_zip(path) -> list[tuple[str, str]]:
     with zipfile.ZipFile(path) as z:
         for info in sorted(z.infolist(), key=lambda i: i.filename):
             name = info.filename
-            if info.is_dir() or "__MACOSX" in name or not name.lower().endswith(".txt"):
+            if info.is_dir() or "__MACOSX" in name or not name.lower().endswith((".txt", ".md")):
                 continue
             raw = z.read(info)
             for enc in ("utf-8-sig", "cp1251"):
@@ -238,18 +238,34 @@ def chunk_document(doc_id: int, text: str) -> list[dict]:
         if DATE.match(line):
             unit["lines"].append(line.strip())
             continue
-        # Do not store a list preamble by itself. Copy it onto each list item.
+        # Вводная перечня. Нумерованный пункт с двоеточием («1. Ставка … При этом:»,
+        # «2. … по ставке 10 процентов при реализации:») — сам норма, поэтому его
+        # сохраняем отдельным чанком и дополнительно повторяем как контекст перечня.
+        # Раньше такая строка терялась, и ключевая ставка/правило исчезали из базы.
         if _is_list_intro(line):
             flush()
             list_group_number += 1
             active_list_context = line.strip()
             active_list_group = f"{doc_id}:{st['art'] or st['section']}:{list_group_number}"
             active_list_number = 0
+            if m := SUB.match(line):
+                nums = m.group(1).split(".")
+                start(point_label(m.group(1)), point=nums[0], subpoint=".".join(nums[1:]),
+                      list_context=active_list_context, list_group=active_list_group)
+                unit["lines"].append(line.strip())
+            elif (m := TOP.match(line)) and not (_is_heading(m.group(2)) and not st["art"]):
+                start(point_label(m.group(1)), point=m.group(1),
+                      list_context=active_list_context, list_group=active_list_group)
+                unit["lines"].append(line.strip())
             continue
         if m := ART.match(line):
             active_list_context = active_list_group = ""
             st.update(art=m.group(1), art_title=m.group(2).strip(), section="")
             start(f"ст. {m.group(1)}")
+            # В некоторых выгрузках текст нормы идёт в одной строке с заголовком
+            # («Статья 1. Установить ... 27 093 рубля»). Без этого теряется сам факт.
+            if m.group(2).strip() and not _is_heading(m.group(2)):
+                unit["lines"].append(line.strip())
         elif m := SEC.match(line):
             active_list_context = active_list_group = ""
             st["section"] = line.strip()[:120]
@@ -284,8 +300,8 @@ def chunk_document(doc_id: int, text: str) -> list[dict]:
         elif active_list_context and _is_unmarked_list_item(line):
             group, item = next_list_item()
             label = f"ст. {st['art']}, абз. {active_list_number}" if st["art"] else f"абз. {active_list_number}"
-            start(label, subpoint=str(active_list_number), list_context=active_list_context,
-                  list_group=group, list_item=item)
+            start(label, point=unit["point"], subpoint=str(active_list_number),
+                  list_context=active_list_context, list_group=group, list_item=item)
             unit["lines"].append(line.strip())
         elif active_list_context and re.match(
                 r"^\s*(?:(?:пункт|абзац)\s+\d+\s+(?:изменен|утратил|дополнен)|"
@@ -294,7 +310,10 @@ def chunk_document(doc_id: int, text: str) -> list[dict]:
             unit["lines"].append(line.strip())
         else:
             if active_list_context:
-                start("")  # закрыть последний пункт перечня перед обычным абзацем
+                # Обычный абзац после перечня: сохраняем привязку к статье/разделу,
+                # иначе чанк теряет локатор (например, продолжение ст. 70 ТК РФ).
+                label = f"ст. {st['art']}" if st["art"] else (st["section"] or "")
+                start(label, point=unit["point"])
             active_list_context = active_list_group = ""
             active_list_number = 0
             unit["lines"].append(line.rstrip())
@@ -370,16 +389,24 @@ def _document_fields(name: str, text: str) -> dict:
 
 
 def _clean_title(name: str, text: str) -> str:
-    article_heading = next((ln.strip() for ln in text.splitlines()
-                            if re.match(r"^\s*статья\s+\d", ln, re.I)), None)
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    # В законах первая строка часто «Статья N изменена с ...»; настоящий заголовок —
+    # «Статья N. Название». Ищем именно его, иначе карточка и поиск теряют тему статьи.
+    law_heading = next(
+        (line for line in lines
+         if re.match(r"^Статья\s+\d+(?:\.\d+)*\.\s+\S", line, re.I)
+         and not re.match(r"^Статья\s+\d+(?:\.\d+)*\s+(?:изменена|дополнена|утратила)", line, re.I)),
+        None,
+    )
+    if law_heading:
+        return law_heading
+    article_heading = next((line for line in lines if re.match(r"^Статья\s+\d", line, re.I)), None)
     if article_heading:
         return article_heading
-    for line in text.splitlines():
-        s = line.strip()
-        if not s or re.match(r"^(источник:|url:|дата выгрузки:|редакция от|редакция утратила силу)", s, re.I):
+    for line in lines:
+        s = line
+        if re.match(r"^(источник:|url:|дата выгрузки:|редакция от|редакция утратила силу)", s, re.I):
             continue
-        if re.match(r"^статья\s+\d", s, re.I):
-            return s
         if len(s) <= 150 and not re.match(r"^ч\w*\s+\w+\s+сил\w*", s, re.I):
             return s
     return Path(name).stem.replace("__", " — ")
@@ -398,12 +425,19 @@ def build_meta(files: list[tuple[str, str]]) -> dict:
         if record:
             d["registry_id"] = record.get("id", "")
             d["document_type"] = record.get("document_type", d.get("document_type", ""))
+            if record.get("title"):
+                d["title"] = str(record["title"])
             d["number"] = record.get("number", "")
             d["parties"] = record.get("parties", [])
-            d["document_date"] = record.get("document_date") or d.get("document_date")
+            # У законов дата принятия не равна редакции; не выдаём её за дату документа.
+            if record.get("document_date"):
+                d["document_date"] = record["document_date"]
+            elif d.get("document_type") == "закон":
+                d["document_date"] = None
             d["edition_date"] = record.get("edition") or d.get("edition_date")
             for key in ("status", "effective_from", "effective_to", "related_contract", "related_documents",
-                        "amends", "changes", "applies_to", "references"):
+                        "amends", "changes", "applies_to", "references", "law_name", "article",
+                        "article_title", "as_of_date"):
                 if key in record:
                     d[key] = record[key]
             d["registry_aliases"] = [norm(str(a)) for a in record.get("aliases", []) if str(a).strip()]
@@ -465,6 +499,87 @@ def chunk_context(docs: list[dict], c: dict) -> str:
     return "\n".join(parts)
 
 
+def _unique(values) -> list[str]:
+    out: list[str] = []
+    for value in values:
+        value = str(value or "").strip()
+        if value and value not in out:
+            out.append(value)
+    return out
+
+
+_POINT_IN_LABEL = re.compile(r"(?:^|,\s*)п(?:одп)?\.\s*(\d+(?:\.\d+)*)")
+
+
+def _doc_points(meta: dict, doc_id: int) -> list[str]:
+    """Номера пунктов/частей документа в порядке появления (из точных локаторов чанков)."""
+    points: list[str] = []
+    for chunk in meta.get("chunks", []):
+        if chunk.get("doc") != doc_id:
+            continue
+        label = norm(chunk.get("label", ""))
+        match = _POINT_IN_LABEL.search(label)
+        if match:
+            points.append(match.group(1))
+            continue
+        # У статей без разбивки на пункты локатор — «ст. N»; саму статью в список частей не добавляем.
+        if chunk.get("point") and not chunk.get("label", "").startswith("ст."):
+            points.append(str(chunk["point"]))
+    return _unique(points)
+
+
+def _doc_sections(meta: dict, doc_id: int) -> list[str]:
+    return _unique(c.get("section") for c in meta.get("chunks", []) if c.get("doc") == doc_id)
+
+
+def document_catalog(meta: dict) -> str:
+    """Компактный справочник всех документов: по нему модель распознаёт отсутствующие акты и редакции."""
+    lines = []
+    for doc in meta.get("docs", []):
+        facts = [f"[{doc['id']}] {doc.get('title') or doc['file']}"]
+        if doc.get("number"):
+            facts.append(f"номер: {doc['number']}")
+        if doc.get("document_date"):
+            facts.append(f"дата: {doc['document_date']}")
+        if doc.get("edition_date"):
+            facts.append(f"редакция: {doc['edition_date']}")
+        if doc.get("effective_from"):
+            facts.append(f"действует с: {doc['effective_from']}")
+        if doc.get("effective_to"):
+            facts.append(f"утратил силу с: {doc['effective_to']}")
+        if doc.get("status"):
+            facts.append(f"статус: {doc['status']}")
+        if doc.get("related_contract"):
+            facts.append(f"связан с договором: {doc['related_contract']}")
+        if doc.get("amends"):
+            facts.append("изменяет: " + ", ".join(doc["amends"]))
+        if doc.get("applies_to"):
+            facts.append(f"применяется: {doc['applies_to']}")
+        lines.append("; ".join(facts))
+    return "\n".join(lines)
+
+
+def document_toc(meta: dict, doc_ids: set[int] | None = None) -> str:
+    """Оглавление найденных документов: какие статьи, части и пункты в них реально есть."""
+    lines = []
+    for doc in meta.get("docs", []):
+        if doc_ids is not None and int(doc["id"]) not in doc_ids:
+            continue
+        points = _doc_points(meta, int(doc["id"]))
+        sections = _doc_sections(meta, int(doc["id"]))
+        if doc.get("article") or doc.get("law_name"):
+            parts = ", ".join(points[:80]) if points else "номера частей не распознаны"
+            title = f" — {doc['article_title']}" if doc.get("article_title") else ""
+            line = (f"- {doc.get('title')}: статья {doc.get('article', '')}{title}; "
+                    f"доступны части/пункты: {parts}.")
+        else:
+            section_text = "; ".join(sections[:12]) if sections else "разделы не распознаны"
+            point_text = ", ".join(points[:80]) if points else "номера пунктов не распознаны"
+            line = f"- {doc.get('title')}: разделы: {section_text}. Пункты: {point_text}."
+        lines.append(line)
+    return "\n".join(lines)
+
+
 # ---------------------------------------------------------------- индекс
 
 def embed_all(texts: list[str]) -> np.ndarray:
@@ -509,13 +624,24 @@ def load_index() -> tuple[dict, np.ndarray] | None:
 
 
 def ensure_index(zip_path=None) -> tuple[dict, np.ndarray]:
-    """Готовый индекс из корня ZIP; если его нет или база изменилась — пересобираем (эмбеддинги через прокси)."""
+    """Готовый индекс из корня ZIP; пересборка — только если он действительно не подходит.
+
+    На платформе база и справочник те же, поэтому совпадения состава файлов и версии
+    схемы достаточно: не тратим минуты прогона на повторные эмбеддинги из-за различий
+    в переводах строк или хэше YAML.
+    """
     loaded = load_index()
     if zip_path and Path(zip_path).exists():
         files = read_zip(zip_path)
-        if (loaded and loaded[0].get("kb_sha") == files_sha(files)
-                and loaded[0].get("registry_sha", "") == _registry_sha()):
-            return loaded
+        if loaded:
+            indexed_names = {str(doc.get("file")) for doc in loaded[0].get("docs", [])}
+            current_names = {name for name, _ in files}
+            if indexed_names == current_names and loaded[0].get("kb_sha") == files_sha(files):
+                return loaded
+            if indexed_names == current_names:
+                print("[kb] хэш базы отличается, но состав документов совпадает — "
+                      "использую готовый индекс", file=sys.stderr)
+                return loaded
         print("[kb] индекс отсутствует или устарел — пересобираю", file=sys.stderr)
         meta = build_meta(files)
         emb = embed_all([chunk_context(meta["docs"], c) for c in meta["chunks"]])
