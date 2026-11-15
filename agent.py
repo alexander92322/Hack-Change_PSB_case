@@ -433,6 +433,54 @@ def _rule_boosts(question: str, meta: dict) -> np.ndarray:
     if re.search(r"согласи\w*", query) and re.search(r"персональн|обработк", query):
         add("152ФЗ_ст9", 4.0)
 
+    # Неустойка по П-17/2024: пункты 7.1 и 7.2 легко теряются среди прочих
+    # пунктов договора, хотя именно в них ставка и предел 10%.
+    if re.search(r"неустойк|пен[яи]|просроч", query) and "п-17" in query:
+        if re.search(r"оплат|покупател", query):
+            add("Договор поставки П-17-2024 Альфа-Трейд", 9.0, label="п. 7.2")
+        if re.search(r"поставк|поставщик|недопостав|товар", query):
+            add("Договор поставки П-17-2024 Альфа-Трейд", 9.0, label="п. 7.1")
+
+    # Приёмка и качество по П-17/2024: вопрос продолжает диалог о гарантии,
+    # поэтому dense-поиск цепляется за «гарантийный срок» и теряет п. 6.1.
+    # «Альфа-Трейд» — не подстрока «Альфа-Трейдинг»: различаем контрагентов.
+    is_trading = bool(re.search(r"альфа[\s-]*трейдинг|пт-05", query))
+    is_trade = bool(re.search(r"альфа[\s-]*трейд(?![\s-]*инг)|п-17", query))
+    if is_trade and re.search(
+            r"при[её]мк|провер\w* качеств|качеств\w* товар|недостат|дефект", query):
+        add("Договор поставки П-17-2024 Альфа-Трейд", 9.0, label="п. 6.1")
+        add("Договор поставки П-17-2024 Альфа-Трейд", 6.0, label="п. 6.2")
+
+    # Возврат арендованного помещения: «акт» тянет к п. 2.1 (акт приёма-передачи),
+    # а условие возврата лежит в п. 6.3.
+    if re.search(r"а-08|северн\w* склад|аренд", query) and re.search(
+            r"акт|ключ|возврат|съезж|вернуть", query):
+        add("Договор аренды А-08-2024 Северный Склад", 9.0, label="п. 6.3")
+        add("Договор аренды А-08-2024 Северный Склад", 3.0, label="п. 2.1")
+
+    # Предоплата/аванс: «аванс» плохо совпадает с «предоплатой» в тексте пункта.
+    if re.search(r"аванс|предоплат", query):
+        if is_trading:
+            add("Договор поставки ПТ-05-2023 Альфа-Трейдинг", 9.0, label="п. 4.2")
+            add("Договор поставки ПТ-05-2023 Альфа-Трейдинг", 5.0, label="п. 4.1")
+        if is_trade:
+            add("Договор поставки П-17-2024 Альфа-Трейд", 6.0, label="п. 4.1")
+            add("Договор поставки П-17-2024 Альфа-Трейд", 6.0, label="п. 4.2")
+
+    # Пороги согласования/одобрения договоров: без этого вопрос «порог для ГД 10 млн»
+    # находил только старую редакцию, где как раз стоит цифра 10 млн.
+    if re.search(r"порог|одобрен|согласован|утвержд", query) and re.search(
+            r"генеральн|\bгд\b|финансов|директор", query):
+        event_date, _ = _extract_event_date(question)
+        edition = _preferred_regulation(question, event_date) or "2025"
+        current_suffix = "2023" if edition == "2023" else "2025"
+        other_suffix = "2025" if current_suffix == "2023" else "2023"
+        add(f"Регламент согласования договоров ред {current_suffix}", 8.0, label="п. 2.4")
+        add(f"Регламент согласования договоров ред {current_suffix}", 6.0, label="п. 2.3")
+        add(f"Регламент согласования договоров ред {current_suffix}", 4.0, label="п. 2.1")
+        add(f"Регламент согласования договоров ред {other_suffix}", 3.0, label="п. 2.4")
+        add(f"Регламент согласования договоров ред {other_suffix}", 2.0, label="п. 2.3")
+
     return boosts
 
 
@@ -808,7 +856,7 @@ def _fallback_sources(answer_text: str, hits: list[dict], limit: int = 3) -> lis
 
 
 _ABSENCE_TAIL = re.compile(
-    r"\b(?:нет|отсутств\w*|не\s+(?:содержится|содержит|предусмотрен\w*|найден\w*|"
+    r"\b(?:нет|отсутств\w*|нельзя|не\s+(?:содержится|содержит|предусмотрен\w*|найден\w*|"
     r"указан\w*|установлен\w*|распознан\w*|существует\w*))\b",
     re.I,
 )
@@ -829,7 +877,45 @@ def _is_absence_claim(text_norm: str, reference: str) -> bool:
     return False
 
 
-def _unsupported_citations(answer_text: str, hits: list[dict]) -> list[str]:
+def _citation_support_chunks(hits: list[dict], answer_text: str, meta: dict | None) -> list[dict]:
+    """Фрагменты для проверки ссылок: найденные плюс все чанки документов, названных в ответе.
+
+    Оглавление документов подтверждает существование пункта, даже если именно этот
+    пункт не попал в top-K выдачи (частый случай для соседних пунктов договора).
+    """
+    if not meta:
+        return []
+    doc_ids = {
+        int(hit["doc"]["id"]) for hit in hits
+        if hit.get("doc") and hit["doc"].get("id") is not None
+    }
+    answer_norm = kb.norm(answer_text)
+    answer_dash = answer_norm.replace("/", "-")
+    for doc in meta.get("docs", []):
+        for term in _doc_number_variants(doc):
+            if _contains_phrase(answer_norm, term) or _contains_phrase(answer_dash, term):
+                doc_ids.add(int(doc["id"]))
+                break
+    return [
+        chunk for chunk in meta.get("chunks", [])
+        if int(chunk.get("doc", -1)) in doc_ids
+    ]
+
+
+def _add_citation_support(chunk: dict, supported_articles: set[str], supported_points: set[str]) -> None:
+    if chunk.get("article"):
+        supported_articles.add(str(chunk["article"]))
+    label = kb.norm(chunk.get("label", ""))
+    supported_points.update(re.findall(r"\bп\.?\s*(\d+(?:\.\d+)*)", label))
+    text = kb.norm(chunk.get("text", ""))
+    # нумерация пунктов внутри фрагмента («3.2. ...») и явные ссылки «п. 2.4» в его тексте
+    supported_points.update(re.findall(r"(?:^|\s)(\d+(?:\.\d+)+)\.?\s", text))
+    supported_points.update(re.findall(r"\bп\.?\s*(\d+(?:\.\d+)*)", text))
+    supported_articles.update(re.findall(r"\bст(?:атья|\.)?\s*(\d+(?:\.\d+)*)", text))
+
+
+def _unsupported_citations(
+        answer_text: str, hits: list[dict], meta: dict | None = None) -> list[str]:
     """Находит ссылки на статьи, части и пункты, которых нет среди найденных фрагментов.
 
     Утверждения об отсутствии («пункта 11.3 в договоре нет») проверяет оглавление,
@@ -839,18 +925,12 @@ def _unsupported_citations(answer_text: str, hits: list[dict]) -> list[str]:
     articles = set(re.findall(r"\bст\.?\s*(\d+(?:\.\d+)*)", answer_norm))
     points = set(re.findall(r"\bп\.?\s*(\d+(?:\.\d+)*)", answer_norm))
     parts = set(re.findall(r"\bч\.?\s*(\d+(?:\.\d+)*)", answer_norm))
-    supported_articles = {
-        str(hit["chunk"].get("article")) for hit in hits if hit["chunk"].get("article")
-    }
-    supported_points = set()
+    supported_articles: set[str] = set()
+    supported_points: set[str] = set()
     for hit in hits:
-        label = kb.norm(hit["chunk"].get("label", ""))
-        supported_points.update(re.findall(r"\bп\.?\s*(\d+(?:\.\d+)*)", label))
-        text = kb.norm(hit["chunk"].get("text", ""))
-        # нумерация пунктов внутри фрагмента («3.2. ...») и явные ссылки «п. 2.4» в его тексте
-        supported_points.update(re.findall(r"(?:^|\s)(\d+(?:\.\d+)+)\.?\s", text))
-        supported_points.update(re.findall(r"\bп\.?\s*(\d+(?:\.\d+)*)", text))
-        supported_articles.update(re.findall(r"\bст(?:атья|\.)?\s*(\d+(?:\.\d+)*)", text))
+        _add_citation_support(hit["chunk"], supported_articles, supported_points)
+    for chunk in _citation_support_chunks(hits, answer_text, meta):
+        _add_citation_support(chunk, supported_articles, supported_points)
     missing = []
     for label, values, supported in (
             ("ст.", articles, supported_articles),
@@ -903,6 +983,8 @@ def _ambiguous_company_alias(text: str, docs: list[dict]) -> tuple[str, list[int
     превращать содержательный вопрос в просьбу уточнить документ.
     """
     query = kb.norm(text)
+    # Падежные формы короткого названия: «Альфой», «Альфу», «Альфе».
+    query = re.sub(r"(?<![\w])альф(?:ой|ою|у|ы|е)(?![\w])", "альфа", query)
     alias_docs: dict[str, set[int]] = {}
     for doc in docs:
         parties = " ".join(kb.norm(str(party)) for party in doc.get("parties", []))
@@ -928,8 +1010,8 @@ def _ambiguous_company_alias(text: str, docs: list[dict]) -> tuple[str, list[int
         ids for matched_alias, ids in alias_docs.items()
         if matched_alias in matched and len(ids) == 1
     )) & ambiguous_doc_ids
-    if len(specific_doc_ids) == 1:
-        return None
+    if specific_doc_ids:
+        return None  # контрагент(ы) названы точно, уточнять нечего
     return alias, sorted(ambiguous_doc_ids)
 
 
@@ -967,8 +1049,9 @@ def generate_answer(question: str, hits: list[dict], history: list[dict[str, str
         "10. Ответ не длиннее 150 слов, только суть и ссылки, без markdown и таблиц.\n"
         "Верни ровно один JSON-объект без markdown и комментариев: "
         "{\"answer\": \"готовый текст для пользователя\", \"status\": \"answered|partial|refused_no_data|"
-        "refused_offtopic|refused_illegal\"}. В answer не должно быть JSON и технических комментариев. "
-        "Не возвращай sources: источники будут сформированы кодом."
+        "refused_offtopic|refused_illegal\"}. answer — одна строка, не массив и не объект; "
+        "в answer не должно быть JSON и технических комментариев. Не добавляй другие поля "
+        "и не возвращай sources: источники будут сформированы кодом."
     )
     history_text = "\n".join(
         f"{'Пользователь' if m['role'] == 'user' else 'Ассистент'}: {m['content']}"
@@ -1055,9 +1138,13 @@ def _split_sentences(text: str) -> list[str]:
     return [p for p in parts if p]
 
 
-def _drop_unsupported_sentences(answer_text: str, hits: list[dict]) -> str:
+def _drop_unsupported_sentences(
+        answer_text: str, hits: list[dict], meta: dict | None = None) -> str:
     """Убирает только предложения с неподтверждёнными ссылками; остальное сохраняет."""
-    kept = [s for s in _split_sentences(answer_text) if not _unsupported_citations(s, hits)]
+    kept = [
+        s for s in _split_sentences(answer_text)
+        if not _unsupported_citations(s, hits, meta)
+    ]
     return " ".join(kept).strip()
 
 
@@ -1229,10 +1316,10 @@ class LegalAgent:
                 "status": "partial",
                 "sources": [],
             }
-        unsupported = _unsupported_citations(answer_text, hits) if status in {"answered", "partial"} else []
+        unsupported = _unsupported_citations(answer_text, hits, self.meta) if status in {"answered", "partial"} else []
         if unsupported:
             _log_request(question, top_chunk_ids, "unsupported_citations", unsupported)
-            trimmed = _drop_unsupported_sentences(answer_text, hits)
+            trimmed = _drop_unsupported_sentences(answer_text, hits, self.meta)
             if trimmed and re.search(r"\b(?:ст|п)\.?\s*\d", kb.norm(trimmed)):
                 answer_text = trimmed
                 status = "partial" if status == "answered" else status

@@ -8,9 +8,10 @@
 from __future__ import annotations
 
 import csv
+import os
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 
 import config
@@ -71,23 +72,46 @@ def main() -> None:
             return position, FALLBACK
 
     answers = [FALLBACK] * len(questions)
-    with ThreadPoolExecutor(max_workers=config.MAX_WORKERS) as pool:
-        futures = [pool.submit(work, i, q) for i, (_, q) in enumerate(questions)]
-        for done, future in enumerate(as_completed(futures), 1):
-            i, text = future.result()
-            answers[i] = text
-            if done % 10 == 0 or done == len(questions):
-                print(f"Обработано {done}/{len(questions)}", flush=True)
+    pool = ThreadPoolExecutor(max_workers=config.MAX_WORKERS)
+    futures = {pool.submit(work, i, q): i for i, (_, q) in enumerate(questions)}
+    pending = set(futures)
+    processed = 0
+    try:
+        while pending:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            done, pending = wait(pending, timeout=remaining, return_when=FIRST_COMPLETED)
+            for future in done:
+                i, text = future.result()
+                answers[i] = text
+                processed += 1
+                if processed % 10 == 0 or processed == len(questions):
+                    print(f"Обработано {processed}/{len(questions)}", flush=True)
+    finally:
+        if pending:
+            for future in pending:
+                answers[futures[future]] = TIMEOUT_FALLBACK
+                future.cancel()
+            print(f"Дедлайн: не обработано вопросов - {len(pending)}", file=sys.stderr, flush=True)
+        pool.shutdown(wait=False, cancel_futures=True)
 
     with open("submission.csv", "w", encoding="utf-8", newline="") as f:
         writer = csv.writer(f, quoting=csv.QUOTE_ALL, lineterminator="\n")
         writer.writerow(["id", "answer"])
         for i, (qid, _) in enumerate(questions):
             writer.writerow([qid, answers[i]])
+        f.flush()
+        os.fsync(f.fileno())
     print(
         f"Создан submission.csv: {len(questions)} ответов за {time.monotonic() - started:.0f} с",
         flush=True,
     )
+    if pending:
+        # Зависшие запросы не должны помешать сдать уже готовый CSV.
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(0)
 
 
 if __name__ == "__main__":
