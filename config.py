@@ -63,5 +63,5 @@ MAX_TOKENS = env_int("MAX_TOKENS", 1024, 128, 8192)
 MAX_WORKERS = env_int("MAX_WORKERS", 4, 1, 16)
 TEMPERATURE = env_float("TEMPERATURE", 0.0)
 
-HTTP_TIMEOUT = 90.0
+HTTP_TIMEOUT = env_float("HTTP_TIMEOUT", 90.0, 5.0, 600.0)  # таймаут одного запроса к модели
 RETRIES = 2  # ограниченные повторы при 429 / 5xx / таймауте (требование регламента)

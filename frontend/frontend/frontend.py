@@ -8,7 +8,11 @@ import os
 
 # Читаем адрес бэкенда из env (для Docker), по умолчанию localhost:8000
 API_URL = os.getenv("BACKEND_URL", "http://localhost:8000")
-ASK_TIMEOUT = 60.0  # ответ с поиском и LLM может идти дольше 30 секунд
+# Сколько ждать ответ /ask. По умолчанию 180 с: локальные модели на CPU отвечают медленно.
+try:
+    ASK_TIMEOUT = float(os.getenv("ASK_TIMEOUT", "180"))
+except ValueError:
+    ASK_TIMEOUT = 180.0
 
 EXAMPLE_QUESTIONS = [
     "Какая арендная плата по договору с ООО «Северный Склад» и до какого числа её вносить?",
