@@ -17,6 +17,182 @@ import llm
 
 REFUSAL = "В базе знаний нет достаточных сведений для подтверждённого ответа."
 PROCESSING_ERROR = "Не удалось обработать ответ. Повторите запрос позже."
+REFUSAL_NOT_CONFIRMED = ("В документах базы знаний нет данных, которые подтверждали бы точный ответ на этот вопрос. "
+                         "По памяти отвечать не буду, чтобы не ошибиться: уточните вопрос или обратитесь к юристу.")
+ILLEGAL_REFUSAL = ("Помочь с этим не могу: запрос направлен на нарушение закона или обход его требований. "
+                   "Могу рассказать, какие требования установлены документами базы знаний.")
+
+
+# ---- Проверка чисел: суммы, сроки, проценты в ответе должны быть в выдержках или в вопросе.
+_NUM_REF = re.compile(
+    r"(?:\b(?:ст|п|ч|подп|пп|абз|разд)\.?\s*\d+(?:\.\d+)*(?:\s*,\s*\d+(?:\.\d+)*)*)"
+    r"|№\s*[\w-]+(?:/\d+)?|\b[А-ЯЁA-Z]{1,4}-\d+(?:/\d{2,4})?|\b\d{1,3}-ФЗ\b|\d+\.\d+\.\d{4}", re.I)
+_NUM = re.compile(r"\d[\d\s\u00a0]*(?:[.,]\d+)?")
+_NUMBER_WORDS = (  # числа прописью в законах: «восемнадцати лет», «шести месяцев»
+    ("одиннадцат", "11"), ("двенадцат", "12"), ("тринадцат", "13"), ("четырнадцат", "14"),
+    ("пятнадцат", "15"), ("шестнадцат", "16"), ("семнадцат", "17"), ("восемнадцат", "18"),
+    ("девятнадцат", "19"), ("двадцат", "20"), ("тридцат", "30"), ("сорок", "40"), ("пятидесят", "50"),
+    ("шестидесят", "60"), ("семидесят", "70"), ("восьмидесят", "80"), ("девяност", "90"),
+    ("двух", "2"), ("двум", "2"), ("два ", "2"), ("две ", "2"), ("трех", "3"), ("трёх", "3"), ("три ", "3"),
+    ("четыр", "4"), ("пят", "5"), ("шест", "6"), ("сем", "7"), ("восем", "8"), ("девят", "9"),
+    ("десят", "10"), ("сто ", "100"), ("ста ", "100"), ("тысяч", "1000"),
+)
+
+
+def _numbers_in(text: str) -> set[str]:
+    text = _NUM_REF.sub(" ", text or "")
+    found: set[str] = set()
+    for match in _NUM.finditer(text):
+        parts = re.split(r"[\s\u00a0]+", match.group(0).strip())
+        if len(parts) > 1 and all(len(part) == 3 for part in parts[1:]):
+            found.add("".join(parts).replace(",", "."))   # «450 000» -> 450000
+        else:
+            found.update(part.replace(",", ".") for part in parts if part)
+    return {n for n in found if n and n not in {"0", "1"}}
+
+
+_RU_NUM = {}
+for _value, _forms in {
+    1: "один одна одной одного одну одном", 2: "два две двух двум", 3: "три трех трёх трем",
+    4: "четыре четырех четырёх", 5: "пять пяти", 6: "шесть шести", 7: "семь семи", 8: "восемь восьми",
+    9: "девять девяти", 10: "десять десяти", 11: "одиннадцать одиннадцати", 12: "двенадцать двенадцати",
+    13: "тринадцать тринадцати", 14: "четырнадцать четырнадцати", 15: "пятнадцать пятнадцати",
+    16: "шестнадцать шестнадцати", 17: "семнадцать семнадцати", 18: "восемнадцать восемнадцати",
+    19: "девятнадцать девятнадцати", 20: "двадцать двадцати", 30: "тридцать тридцати", 40: "сорок сорока",
+    50: "пятьдесят пятидесяти", 60: "шестьдесят шестидесяти", 70: "семьдесят семидесяти",
+    80: "восемьдесят восьмидесяти", 90: "девяносто девяноста", 100: "сто ста", 200: "двести двухсот",
+    300: "триста трехсот трёхсот", 400: "четыреста четырехсот", 500: "пятьсот пятисот",
+    600: "шестьсот шестисот", 700: "семьсот семисот", 800: "восемьсот восьмисот", 900: "девятьсот девятисот",
+}.items():
+    for _form in _forms.split():
+        _RU_NUM[_form] = _value
+_RU_MULT = {"тысяча": 1000, "тысячи": 1000, "тысяч": 1000, "тысячу": 1000,
+            "миллион": 10 ** 6, "миллиона": 10 ** 6, "миллионов": 10 ** 6}
+
+
+def _word_numbers(text: str) -> set[str]:
+    """Числа прописью: «от десяти тысяч до двадцати тысяч» -> {10, 10000, 20, 20000}."""
+    found: set[str] = set()
+    total = group = 0
+    seen = False
+    for token in re.findall(r"[а-яё]+|\d+|[^\sа-яё\d]", kb.norm(text or "")):
+        if token in _RU_NUM:
+            group += _RU_NUM[token]
+            seen = True
+            found.add(str(group))
+        elif token in _RU_MULT and (seen or group):
+            total += (group or 1) * _RU_MULT[token]
+            group = 0
+            found.add(str(total))
+        else:
+            if seen:
+                found.add(str(total + group))
+            total = group = 0
+            seen = False
+    if seen:
+        found.add(str(total + group))
+    return found
+
+
+def _unsupported_numbers(answer_text: str, hits: list[dict], context_text: str) -> list[str]:
+    """Числа ответа, которых нет ни в выдержках, ни в вопросе/истории. Нестрогая проверка:
+    число принимается, если встречается где угодно в цифрах выдержек (в том числе внутри дат и сумм)."""
+    evidence = " ".join(
+        f"{hit['doc'].get('title', '')} {hit['chunk'].get('list_context', '')} {hit['chunk'].get('text', '')}"
+        for hit in hits)
+    allowed_numbers = _numbers_in(evidence) | _numbers_in(context_text)
+    lowered = kb.norm(evidence)
+    allowed_numbers.update(digit for stem, digit in _NUMBER_WORDS if stem in lowered)
+    allowed_numbers.update(_word_numbers(evidence))
+    allowed_digits = re.sub(r"[\s\u00a0]+", "", evidence + " " + context_text)
+    missing = []
+    for number in _numbers_in(answer_text):
+        if number in allowed_numbers or number.split(".")[0] in allowed_numbers or number in allowed_digits:
+            continue
+        missing.append(number)
+    return missing
+
+
+_UNIT = r"(рабоч\w*|календарн\w*|дн(?:я|ей|ю|ем|и)\b|день\b|месяц\w*|лет\b|год\w*|недел\w*|час\w*|%|процент\w*|руб\w*|млн|тыс\w*)"
+_PAIR_DIGITS = re.compile(r"(\d[\d\s\u00a0]*(?:[.,]\d+)?)\s*(?:\([^)]{1,40}\)\s*)?" + _UNIT, re.I)
+_WORD_NUMBERS = {
+    "одного": "1", "одной": "1", "один": "1", "одну": "1", "двух": "2", "два": "2", "две": "2", "трех": "3",
+    "три": "3", "четырех": "4", "четыре": "4", "пяти": "5", "пять": "5", "шести": "6", "шесть": "6",
+    "семи": "7", "семь": "7", "восьми": "8", "восемь": "8", "девяти": "9", "девять": "9", "десяти": "10",
+    "десять": "10", "двенадцати": "12", "четырнадцати": "14", "пятнадцати": "15", "шестнадцати": "16",
+    "восемнадцати": "18", "двадцати": "20", "тридцати": "30", "сорока": "40", "сорок": "40",
+    "пятидесяти": "50", "шестидесяти": "60", "девяноста": "90", "ста": "100",
+}
+_PAIR_WORDS = re.compile(r"\b(" + "|".join(sorted(_WORD_NUMBERS, key=len, reverse=True)) + r")\s+(?:\(\s*)?"
+                         + _UNIT, re.I)
+
+
+def _unit_key(unit: str) -> str:
+    unit = kb.norm(unit)
+    for stem in ("рабоч", "календарн", "месяц", "недел", "час", "процент", "руб", "млн", "тыс", "год"):
+        if unit.startswith(stem):
+            return {"процент": "%", "год": "лет"}.get(stem, stem)
+    if unit in {"лет"}:
+        return "лет"
+    if unit.startswith(("дн", "день")):
+        return "дн"
+    return unit
+
+
+def _number_unit_pairs(text: str) -> set[tuple[str, str]]:
+    text = _NUM_REF.sub(" ", kb.norm(text or ""))
+    pairs = set()
+    for number, unit in _PAIR_DIGITS.findall(text):
+        digits = re.sub(r"[\s\u00a0]+", "", number).replace(",", ".")
+        pairs.add((digits, _unit_key(unit)))
+    for word, unit in _PAIR_WORDS.findall(text):
+        pairs.add((_WORD_NUMBERS[word.lower()], _unit_key(unit)))
+    return pairs
+
+
+def _unsupported_number_units(answer_text: str, hits: list[dict], context_text: str) -> list[str]:
+    """«10 рабочих дней», «9 месяцев», «25%»: пара «число + единица» должна быть в выдержках или вопросе.
+    Ловит подмену маленьких чисел, которые нестрогая проверка пропускает (цифра «5» есть везде)."""
+    evidence = " ".join(f"{hit['chunk'].get('list_context', '')} {hit['chunk'].get('text', '')}" for hit in hits)
+    allowed = _number_unit_pairs(evidence) | _number_unit_pairs(context_text)
+    allowed_by_unit: dict[str, set[str]] = {}
+    for number, unit in allowed:
+        allowed_by_unit.setdefault(unit, set()).add(number)
+    missing = []
+    for number, unit in _number_unit_pairs(answer_text):
+        if unit in {"руб", "млн", "тыс"}:
+            continue  # суммы проверяет общая проверка чисел (450 000 / 3 млн / 3 000 000 - разные записи)
+        if number in allowed_by_unit.get(unit, set()):
+            continue
+        # «рабочих дней» и «дней» - одна единица для сравнения, если в документе указано «N рабочих дней»
+        if unit == "дн" and (number in allowed_by_unit.get("рабоч", set())
+                             or number in allowed_by_unit.get("календарн", set())):
+            continue
+        missing.append(number)
+    return missing
+
+
+def _has_substance(text: str) -> bool:
+    """После вырезания осталось содержание, а не только «Источник: …»."""
+    body = " ".join(sentence for sentence in _split_sentences(text or "")
+                    if not re.match(r"\s*(?:источник|источники|см\.)\b", sentence, re.I))
+    return len(re.findall(r"[А-Яа-яЁёA-Za-z]{3,}", body)) >= 4
+
+
+def _drop_sentences_with_numbers(answer_text: str, numbers: list[str]) -> str:
+    kept = [sentence for sentence in _split_sentences(answer_text)
+            if not (_numbers_in(sentence) & set(numbers))]
+    return " ".join(kept).strip()
+
+
+def _missing_norms_refusal(refs: list[str]) -> str:
+    """Отказ, когда ответ опирался на нормы, которых нет в базе: называем их, а не пишем безликое «нет сведений»."""
+    articles = [ref.replace("ст. ", "") for ref in refs if ref.startswith("ст.")]
+    if not articles:
+        return REFUSAL
+    named = ("статьи " if len(articles) == 1 else "статей ") + ", ".join(articles[:4])
+    return (f"В базе знаний нет {named}, а в имеющихся документах ответа на этот вопрос не нашлось. "
+            "По памяти отвечать не буду, чтобы не ошибиться: уточните вопрос или обратитесь к юристу.")
 _ANSWER_STATUSES = {"answered", "partial", "refused_no_data", "refused_offtopic", "refused_illegal"}
 _ROLE_MARKER = re.compile(
     r"(?:^|\n|\s/\s|\s\|\s)\s*(Пользователь|Ассистент|user|assistant)\s*:\s*",
@@ -817,26 +993,76 @@ def _add_list_neighbours(hits: list[dict], meta: dict) -> list[dict]:
     return hits + additions
 
 
+def _doc_metadata(doc: dict) -> str:
+    metadata = []
+    if doc.get("number"): metadata.append(f"номер {doc['number']}")
+    if doc.get("parties"): metadata.append("стороны: " + "; ".join(doc["parties"]))
+    if doc.get("document_date"): metadata.append(f"дата: {doc['document_date']}")
+    if doc.get("edition_date"): metadata.append(f"редакция: {doc['edition_date']}")
+    if doc.get("status"): metadata.append(f"статус: {doc['status']}")
+    if doc.get("related_contract"): metadata.append(f"связан с договором № {doc['related_contract']}")
+    if doc.get("related_documents"): metadata.append("связанные документы: " + "; ".join(doc["related_documents"]))
+    if doc.get("amends"): metadata.append("изменяет: " + ", ".join(doc["amends"]))
+    if doc.get("applies_to"): metadata.append(f"применяется: {doc['applies_to']}")
+    if doc.get("references"): metadata.append("ссылки: " + "; ".join(doc["references"]))
+    return "\nМетаданные: " + "; ".join(metadata) if metadata else ""
+
+
 def _format_evidence(hits: list[dict]) -> str:
-    out = []
+    """Выдержки для модели. Пункты одного перечня («не устанавливается для: …») склеиваются в один
+    блок под общей шапкой: иначе восемь отдельных блоков с «не устанавливается» перевешивают
+    единственный фрагмент с ответом, и модель (особенно небольшая) делает неверный вывод."""
+    blocks: list[dict] = []
+    list_blocks: dict[tuple, dict] = {}
     for hit in hits:
         doc, chunk = hit["doc"], hit["chunk"]
         locator = chunk.get("label") or (f"ст. {chunk['article']}" if chunk.get("article") else "")
-        metadata = []
-        if doc.get("number"): metadata.append(f"номер {doc['number']}")
-        if doc.get("parties"): metadata.append("стороны: " + "; ".join(doc["parties"]))
-        if doc.get("document_date"): metadata.append(f"дата: {doc['document_date']}")
-        if doc.get("edition_date"): metadata.append(f"редакция: {doc['edition_date']}")
-        if doc.get("status"): metadata.append(f"статус: {doc['status']}")
-        if doc.get("related_contract"): metadata.append(f"связан с договором № {doc['related_contract']}")
-        if doc.get("related_documents"): metadata.append("связанные документы: " + "; ".join(doc["related_documents"]))
-        if doc.get("amends"): metadata.append("изменяет: " + ", ".join(doc["amends"]))
-        if doc.get("applies_to"): metadata.append(f"применяется: {doc['applies_to']}")
-        if doc.get("references"): metadata.append("ссылки: " + "; ".join(doc["references"]))
-        details = "\nМетаданные: " + "; ".join(metadata) if metadata else ""
-        list_context = (f"\nКонтекст перечня: {chunk['list_context']}" if chunk.get("list_context") else "")
-        out.append(f"Документ: {doc.get('title') or doc['file']} (файл: {doc['file']}); пункт/ссылка: {locator or 'не указан'}{details}{list_context}\n{chunk['text']}")
+        context = str(chunk.get("list_context") or "").strip()
+        key = (doc["file"], context)
+        if context and key in list_blocks:
+            list_blocks[key]["items"].append((locator, chunk["text"]))
+            continue
+        block = {"doc": doc, "locator": locator, "context": context, "items": [(locator, chunk["text"])]}
+        blocks.append(block)
+        if context:
+            list_blocks[key] = block
+    out = []
+    for block in blocks:
+        doc = block["doc"]
+        head = f"Документ: {doc.get('title') or doc['file']} (файл: {doc['file']})"
+        if len(block["items"]) == 1:
+            locator, text = block["items"][0]
+            list_context = f"\nКонтекст перечня: {block['context']}" if block["context"] else ""
+            out.append(f"{head}; пункт/ссылка: {locator or 'не указан'}{_doc_metadata(doc)}{list_context}\n{text}")
+            continue
+        items = sorted(block["items"], key=lambda item: _natural_label_key(item[0]))
+        locators = ", ".join(locator for locator, _ in items if locator)
+        body = "\n".join(f"— ({locator}) {text.strip()}" for locator, text in items)
+        out.append(f"{head}; пункты одного перечня: {locators}{_doc_metadata(doc)}\n"
+                   f"Перечень (все пункты ниже относятся к этой фразе): {block['context']}\n{body}")
     return "\n\n---\n\n".join(out)
+
+
+def _natural_label_key(label: str) -> list:
+    return [int(part) if part.isdigit() else part for part in re.split(r"(\d+)", label or "")]
+
+
+def _doc_named_in(doc: dict, answer_norm: str) -> bool:
+    """Назван ли документ в ответе: номер, название, синоним или дата редакции/документа."""
+    identifiers = [doc.get("number", ""), doc.get("title", ""), Path(doc["file"]).stem]
+    identifiers.extend(a for a in doc.get("registry_aliases", []) if len(a) > 5 and a != "альфа")
+    for date_key in ("edition_date", "document_date"):
+        value = str(doc.get(date_key) or "")
+        iso = re.fullmatch(r"(\d{4})-(\d{2})-(\d{2})", value)
+        if iso:  # в метаданных ISO, в ответах - «10.01.2023»
+            value = f"{iso.group(3)}.{iso.group(2)}.{iso.group(1)}"
+        if re.fullmatch(r"\d{2}\.\d{2}\.\d{4}", value):
+            identifiers.append(value)
+    number = str(doc.get("number") or "")
+    short = re.search(r"[A-Za-zА-Яа-яЁё]{1,4}-\d+(?:/\d{4})?", number)
+    if short:
+        identifiers.append(short.group(0))
+    return any(kb.norm(value) in answer_norm for value in identifiers if value and len(str(value)) >= 3)
 
 
 def _sources_for_answer(answer_text: str, hits: list[dict]) -> list[dict]:
@@ -849,12 +1075,16 @@ def _sources_for_answer(answer_text: str, hits: list[dict]) -> list[dict]:
         label = chunk.get("label") or (f"ст. {chunk['article']}" if chunk.get("article") else "")
         label_norm = kb.norm(label)
         ref_tokens = re.findall(r"(?:ст\.|п\.|подп\.|ч\.)\s*\d+(?:\.\d+)*", label_norm)
-        if not ref_tokens or not any(token in answer_norm for token in ref_tokens):
+        doc_is_named = _doc_named_in(doc, answer_norm)
+        if not ref_tokens:
+            # Документ без пунктов (служебная записка, письмо): карточка, если документ назван в ответе.
+            # У договоров «шапка» без пункта карточкой не нужна - там есть пункты.
+            doc_has_points = any(other["doc"]["id"] == doc["id"] and other["chunk"].get("label")
+                                 for other in hits)
+            if label or doc_has_points or not doc_is_named:
+                continue
+        elif not any(token in answer_norm for token in ref_tokens):
             continue
-
-        identifiers = [doc.get("number", ""), doc.get("title", ""), Path(doc["file"]).stem]
-        identifiers.extend(a for a in doc.get("registry_aliases", []) if len(a) > 5 and a != "альфа")
-        doc_is_named = any(kb.norm(value) in answer_norm for value in identifiers if value)
         if not doc_is_named and chunk.get("article"):
             same_article_docs = {
                 int(other["doc"]["id"]) for other in hits
@@ -869,20 +1099,41 @@ def _sources_for_answer(answer_text: str, hits: list[dict]) -> list[dict]:
         if key in seen:
             continue
         seen.add(key)
-        backend_doc_id, backend_title = docs_kb.doc_ref_for_file(doc["file"])
-        result.append({
-            "doc_id": backend_doc_id,
-            "doc_title": backend_title or str(doc.get("title") or doc["file"]),
-            "point": str(label),
-            "text": str(chunk.get("text", "")),
-            "score": float(hit.get("score", 0.0)),
-        })
-    return result
+        result.append(_source_entry(hit))
+    # Ссылка «ст. 70» подходит ко всем фрагментам статьи. Показываем те, где есть содержание ответа
+    # (слова и числа), и не больше трёх - иначе карточка открывает случайные абзацы.
+    answer_stems = {_stem(token) for token in _token_list(answer_text) if len(token) >= 4}
+    def overlap(entry: dict) -> int:
+        return len(answer_stems & {_stem(token) for token in _token_list(entry["text"])})
+    ranked = sorted(enumerate(result), key=lambda pair: (-overlap(pair[1]), pair[0]))
+    best = overlap(ranked[0][1]) if ranked else 0
+    kept = [entry for _, entry in ranked if best == 0 or overlap(entry) >= max(2, round(best * 0.6))
+            or entry is ranked[0][1]]
+    return kept[:MAX_SOURCES]
+
+
+MAX_SOURCES = 3
+
+
+def _source_entry(hit: dict) -> dict:
+    doc, chunk = hit["doc"], hit["chunk"]
+    label = chunk.get("label") or (f"ст. {chunk['article']}" if chunk.get("article") else "")
+    backend_doc_id, backend_title = docs_kb.doc_ref_for_file(doc["file"])
+    return {
+        "doc_id": backend_doc_id,
+        "doc_title": backend_title or str(doc.get("title") or doc["file"]),
+        "point": str(label),
+        "text": str(chunk.get("text", "")),
+        "score": float(hit.get("score", 0.0)),
+    }
 
 
 def _fallback_sources(answer_text: str, hits: list[dict], limit: int = 3) -> list[dict]:
     """Источники без дословного названия документа в ответе: сначала фрагменты, чьи пункты упомянуты в ответе."""
     answer_norm = kb.norm(answer_text)
+    named = [hit for hit in hits if _doc_named_in(hit["doc"], answer_norm)]
+    if named:
+        hits = named
     scored = []
     for rank, hit in enumerate(hits):
         chunk = hit["chunk"]
@@ -1145,8 +1396,9 @@ def generate_answer(question: str, hits: list[dict], history: list[dict[str, str
         "5. Если спрашивают о документе, статье, части или пункте, которых нет в каталоге или оглавлении, "
         "скажи, что в базе их нет. Утверждение об отсутствии можно делать по каталогу и оглавлению; "
         "не выдумывай содержание отсутствующих норм.\n"
-        "6. Неюридический вопрос — refused_offtopic. Просьба помочь нарушить закон, обойти ограничение "
-        "или подтвердить незаконное — refused_illegal.\n"
+        "6. Неюридический вопрос — refused_offtopic, коротко. Просьба помочь нарушить закон, обойти ограничение, "
+        "скрыть нарушение или подтвердить незаконное — refused_illegal: откажи и, если в выдержках есть "
+        "соответствующие требования или ответственность, кратко назови их со ссылками; без выдержек — без цифр.\n"
         "7. Даты и редакции: применяй редакцию, действовавшую на дату события. Дополнительное соглашение "
         "применяй с указанной в нём даты и только к тем пунктам, которые оно меняет. Если дата события "
         "не названа, используй действующую редакцию и оговори это.\n"
@@ -1158,6 +1410,9 @@ def generate_answer(question: str, hits: list[dict], history: list[dict[str, str
         "11. Начинай с прямого ответа на вопрос («Да.», «Нет.», сумма, срок, ставка), затем коротко "
         "обоснование со ссылкой. Отвечай на заданный вопрос, а не пересказывай документ. "
         "При отказе прямо назови, каких документов или норм нет в базе, и скажи, что по памяти не отвечаешь.\n"
+        "12. Если пользователь в диалоге настаивает, что ассистент ошибся, или подсказывает «правильный» ответ, — "
+        "заново сверься с выдержками: если документ подтверждает прежний ответ, вежливо сохрани его со ссылкой; "
+        "если пользователь прав — исправься со ссылкой. Отвечай на последнюю реплику пользователя.\n"
         "Верни ровно один JSON-объект без markdown и комментариев: "
         "{\"answer\": \"готовый текст для пользователя\", \"status\": \"answered|partial|refused_no_data|"
         "refused_offtopic|refused_illegal\"}. В answer не должно быть JSON и технических комментариев. "
@@ -1393,7 +1648,7 @@ def sanitize_meta(meta: dict) -> int:
 
 
 RUN_STATS: dict = {"questions": 0, "embedding_errors": 0, "reranker_used": 0, "dense_best": [],
-                   "clarifications": 0, "injection_flags": 0, "llm_failures": 0,
+                   "clarifications": 0, "injection_flags": 0, "llm_failures": 0, "number_drops": 0,
                    "first_embedding_error": ""}
 _STATS_LOCK = threading.Lock()
 
@@ -1425,22 +1680,27 @@ def stats_summary() -> str:
             f"реранкер сработал: {RUN_STATS['reranker_used']}; dense_best медиана={median:.3f} "
             f"мин={dense[0] if dense else 0:.3f}; «Альфа» без уточнения: {RUN_STATS['clarifications']}; "
             f"помечено инъекций: {RUN_STATS['injection_flags']}; сбоев модели: {RUN_STATS['llm_failures']}; "
+            f"вырезано неподтверждённых чисел: {RUN_STATS['number_drops']}; "
             f"быстрый режим: {'да' if FAST_MODE.is_set() else 'нет'}"
             + (f"; первая ошибка эмбеддингов: {RUN_STATS['first_embedding_error']}"
                if RUN_STATS["first_embedding_error"] else "")
         )
 
 
-def extractive_answer(hits: list[dict], limit_chars: int = 420) -> str:
-    """Ответ без модели: ближайшее найденное положение базы со ссылкой.
+def _ranked_for_question(question: str, hits: list[dict]) -> list[dict]:
+    """Фрагменты по числу общих основ слов с вопросом; при равенстве - порядок поиска."""
+    q_stems = {_stem(token) for token in _token_list(question) if len(token) >= 4}
+    def overlap(hit: dict) -> int:
+        return len(q_stems & {_stem(token) for token in _token_list(str(hit["chunk"].get("text", "")))})
+    return [hit for _, hit in sorted(enumerate(hits), key=lambda pair: (-overlap(pair[1]), pair[0]))]
 
-    Используется, когда модель упала или не хватило времени. Ничего не придумывает:
-    только дословный фрагмент документа и его реквизиты. Лучше пустой заглушки, за которую
-    судья гарантированно ставит 0.
-    """
-    if not hits:
-        return REFUSAL
-    hit = hits[0]
+
+def best_hit_for(question: str, hits: list[dict]) -> dict | None:
+    ranked = _ranked_for_question(question, hits) if question else hits
+    return ranked[0] if ranked else None
+
+
+def _quote(hit: dict, limit_chars: int) -> str:
     doc, chunk = hit["doc"], hit["chunk"]
     title = str(doc.get("title") or doc.get("file") or "документ")
     label = str(chunk.get("label") or "")
@@ -1449,9 +1709,27 @@ def extractive_answer(hits: list[dict], limit_chars: int = 420) -> str:
         cut = text[:limit_chars]
         end = max(cut.rfind(". "), cut.rfind("; "))
         text = (cut[:end + 1] if end > limit_chars // 3 else cut.rstrip()) + " …"
-    ref = f"{title}, {label}" if label else title
-    return ("Полностью сформировать ответ не удалось. Ближайшее положение в базе знаний "
-            f"({ref}): «{text}». Проверьте, относится ли оно к вашей ситуации.")
+    return f"{title}, {label}: «{text}»" if label else f"{title}: «{text}»"
+
+
+def extractive_answer(hits: list[dict], limit_chars: int = 420, question: str = "") -> str:
+    """Ответ без модели: два ближайших положения базы дословно, со ссылками.
+
+    Используется, когда модель упала или не хватило времени. Ничего не придумывает:
+    только текст документов и их реквизиты. Лучше пустой заглушки, за которую судья ставит 0.
+    """
+    if not hits:
+        return REFUSAL
+    ranked = (_ranked_for_question(question, hits) if question else hits)[:2]
+    quotes = [_quote(ranked[0], limit_chars)]
+    if len(ranked) > 1:
+        quotes.append(_quote(ranked[1], limit_chars // 2))
+    return ("Полностью сформировать ответ не удалось. Ближайшие положения базы знаний: "
+            + "; ".join(quotes) + ". Проверьте, относятся ли они к вашей ситуации.")
+
+
+def fallback_sources(question: str, hits: list[dict]) -> list[dict]:
+    return [_source_entry(hit) for hit in (_ranked_for_question(question, hits) if question else hits)[:2]]
 
 
 class LegalAgent:
@@ -1493,8 +1771,8 @@ class LegalAgent:
                         else retrieve(retrieval_query, self.meta, self.vectors, use_api=False))
             except Exception:
                 hits = []
-            return {"answer": extractive_answer(hits) if hits else PROCESSING_ERROR,
-                    "status": "partial", "sources": []}
+            return {"answer": extractive_answer(hits, question=current) if hits else PROCESSING_ERROR,
+                    "status": "partial", "sources": fallback_sources(current, hits)}
         _record_stats(search_diagnostics)
         top_chunk_ids = [int(hit["chunk"]["id"]) for hit in hits]
         if not hits:
@@ -1514,28 +1792,39 @@ class LegalAgent:
                 error_info["retrieval"] = search_diagnostics
             _log_request(question, top_chunk_ids, "parse_error", error_info)
             _record_stats(llm_failures=1)
-            return {"answer": extractive_answer(hits), "status": "partial", "sources": []}
+            return {"answer": extractive_answer(hits, question=current), "status": "partial",
+                    "sources": fallback_sources(current, hits)}
         except ModelOutputLimitError as exc:
             _log_request(question, top_chunk_ids, "output_limit_error", {
                 "message": str(exc),
                 "first_raw_model_response": exc.first_raw,
                 "retry_raw_model_response": exc.retry_raw,
             })
-            return {"answer": extractive_answer(hits), "status": "partial", "sources": []}
+            return {"answer": extractive_answer(hits, question=current), "status": "partial",
+                    "sources": fallback_sources(current, hits)}
         except Exception as exc:
             _log_request(question, top_chunk_ids, "error", f"{type(exc).__name__}: {exc}")
             _record_stats(llm_failures=1)
-            return {"answer": extractive_answer(hits), "status": "partial", "sources": []}
+            return {"answer": extractive_answer(hits, question=current), "status": "partial",
+                    "sources": fallback_sources(current, hits)}
         # Enforce the platform limit on the actual generated text at the return boundary.
         # Keep citations/sources in sync with the text that the caller will receive.
         if not _within_answer_limits(answer_text):
             _log_request(question, top_chunk_ids, "output_limit_error", "ответ не прошёл проверку длины")
-            return {"answer": extractive_answer(hits), "status": "partial", "sources": []}
+            return {"answer": extractive_answer(hits, question=current), "status": "partial",
+                    "sources": fallback_sources(current, hits)}
+        if status == "refused_illegal":
+            # В отказе модель может «пояснить последствия» - штрафы по памяти недопустимы.
+            unsupported = _unsupported_citations(answer_text, hits)
+            if unsupported:
+                _log_request(question, top_chunk_ids, "unsupported_citations", unsupported)
+                trimmed = _drop_unsupported_sentences(answer_text, hits)
+                answer_text = trimmed if trimmed and _has_substance(trimmed) else ILLEGAL_REFUSAL
         unsupported = _unsupported_citations(answer_text, hits) if status in {"answered", "partial"} else []
         if unsupported:
             _log_request(question, top_chunk_ids, "unsupported_citations", unsupported)
             trimmed = _drop_unsupported_sentences(answer_text, hits)
-            if trimmed and re.search(r"\b(?:ст|п)\.?\s*\d", kb.norm(trimmed)):
+            if trimmed and _has_substance(trimmed) and re.search(r"\b(?:ст|п)\.?\s*\d", kb.norm(trimmed)):
                 answer_text = trimmed
                 status = "partial" if status == "answered" else status
             elif not any(ref.startswith("ст.") for ref in unsupported):
@@ -1543,8 +1832,28 @@ class LegalAgent:
                 # а не весь ответ. Отказ вместо правильного ответа стоит дороже неточной ссылки.
                 answer_text = _strip_point_refs(answer_text, unsupported)
             else:
-                return {"answer": REFUSAL, "status": "refused_no_data", "sources": []}
-        sources = _sources_for_answer(answer_text, hits) if status in {"answered", "partial"} else []
+                return {"answer": _missing_norms_refusal(unsupported), "status": "refused_no_data",
+                        "sources": []}
+        if status in {"answered", "partial", "refused_illegal"}:
+            context_text = current + " " + " ".join(m["content"] for m in history_messages)
+            bad_numbers = sorted(set(_unsupported_numbers(answer_text, hits, context_text))
+                                 | set(_unsupported_number_units(answer_text, hits, context_text)))
+            if bad_numbers:
+                # Число не из документов и не из вопроса - вероятно, по памяти: судья обнуляет такой ответ.
+                _log_request(question, top_chunk_ids, "unsupported_numbers", bad_numbers)
+                _record_stats(number_drops=1)
+                trimmed = _drop_sentences_with_numbers(answer_text, bad_numbers)
+                if trimmed and _has_substance(trimmed):
+                    answer_text = trimmed
+                    status = "partial" if status == "answered" else status
+                elif status == "refused_illegal":
+                    answer_text = ILLEGAL_REFUSAL
+                else:
+                    return {"answer": REFUSAL_NOT_CONFIRMED, "status": "refused_no_data", "sources": []}
+        sources = (_sources_for_answer(answer_text, hits)
+                   if status in {"answered", "partial", "refused_illegal"} else [])
+        if status == "refused_illegal" and not re.search(r"\b(?:ст|п|ч)\.\s*\d", kb.norm(answer_text)):
+            sources = []
         if status in {"answered", "partial"} and not sources:
             _log_request(question, top_chunk_ids, "missing_sources", search_diagnostics or None)
             sources = _fallback_sources(answer_text, hits)
@@ -1559,7 +1868,7 @@ class LegalAgent:
             history_messages = (_normalise_history(history) + embedded_history)[-8:]
             query = "\n".join([f"Контекст {m['role']}: {m['content']}" for m in history_messages[-4:]]
                               + [f"Текущий вопрос: {current}"])
-            return extractive_answer(retrieve(query, self.meta, self.vectors, use_api=False))
+            return extractive_answer(retrieve(query, self.meta, self.vectors, use_api=False), question=current)
         except Exception as exc:
             print(f"[fallback] {type(exc).__name__}: {exc}", file=sys.stderr)
             return PROCESSING_ERROR

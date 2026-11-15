@@ -607,7 +607,7 @@ def embed_queries(texts: list[str]) -> np.ndarray:
         return np.asarray(_local_model().encode(texts, batch_size=16, normalize_embeddings=True,
                                                 show_progress_bar=False), dtype="float32")
     import llm
-    return llm.embed(texts)
+    return llm.embed(texts, timeout=30.0)  # запрос пользователя: короткий таймаут + предохранитель
 
 
 def save_index(meta: dict, emb: np.ndarray) -> None:
