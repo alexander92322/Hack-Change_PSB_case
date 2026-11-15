@@ -55,7 +55,12 @@ RERANK_KEY = env("RERANKER_API_KEY") or LLM_KEY
 
 LLM_MODEL = env("LLM_MODEL", "GEN_MODEL", "OPENAI_MODEL", default="deepseek/deepseek-v4.1-flash")
 EMB_MODEL = env("EMB_MODEL", default="baai/bge-m3")
-RERANKER_MODEL = env("RERANKER_MODEL")  # имя реранкера берём только из окружения
+# Как в примере организаторов: если платформа не передала имя, используем их значение по умолчанию
+# (иначе реранкер молча выключен). Явно отключить: RERANKER_MODEL=none. Неверное имя безопасно:
+# после нескольких ошибок llm.RERANK_BREAKER отключает реранкер.
+RERANKER_MODEL = env("RERANKER_MODEL", default="cohere/rerank-5-fast")
+if RERANKER_MODEL.lower() in {"none", "off", "0", "false"}:
+    RERANKER_MODEL = ""
 
 TOP_K = env_int("TOP_K", 8, 1, 50)
 RERANKER_TOP_N = env_int("RERANKER_TOP_N", 5, 1, 20)

@@ -1,6 +1,7 @@
 """Единый RAG-агент для CLI-сабмита и локального HTTP API."""
 from __future__ import annotations
 
+import os
 import re
 import sys
 import csv
@@ -960,7 +961,37 @@ def retrieve(question: str, meta: dict, vectors: np.ndarray, top_k: int = 8,
                            for doc_id, weight in sorted(focus.items())},
             "reranker": bool(reranked),
         })
-    return _add_list_neighbours(selected_hits, meta)
+    return _add_date_definitions(_add_list_neighbours(selected_hits, meta), meta)
+
+
+_DATE_REF = re.compile(r"(?:с|от|после|до)\s+(?:даты|дня)\s+([а-яё]{4,})", re.I)
+
+
+def _add_date_definitions(hits: list[dict], meta: dict, limit: int = 3) -> list[dict]:
+    """Если найденный пункт отсчитывает срок «с даты поставки», добавляет пункт того же документа,
+    где эта дата определена («Датой поставки считается ...»). Без него модель не может сказать,
+    от какого события считать срок, а проверка чисел вырезает правильное предложение из ответа."""
+    chunks = meta.get("chunks", [])
+    seen = {int(hit["chunk"]["id"]) for hit in hits}
+    total_chars = sum(len(kb.chunk_context([hit["doc"]], {**hit["chunk"], "doc": 0})) for hit in hits)
+    additions: list[dict] = []
+    for hit in hits:
+        for term in {m.group(1).lower() for m in _DATE_REF.finditer(hit["chunk"].get("text", ""))}:
+            definition = re.compile(rf"\bдат(?:ой|а|ою)\s+{re.escape(term)}\s+(?:считается|является|признаётся|признается)", re.I)
+            for candidate in chunks:
+                cid = int(candidate["id"])
+                if cid in seen or candidate["doc"] != hit["chunk"]["doc"] or not definition.search(candidate["text"]):
+                    continue
+                size = len(kb.chunk_context(meta["docs"], candidate))
+                if total_chars + size > MAX_EVIDENCE_CHARS:
+                    continue
+                additions.append({"doc": meta["docs"][candidate["doc"]], "chunk": candidate,
+                                  "score": float(hit.get("score", 0.0))})
+                seen.add(cid)
+                total_chars += size
+                if len(additions) >= limit:
+                    return hits + additions
+    return hits + additions
 
 
 def _add_list_neighbours(hits: list[dict], meta: dict) -> list[dict]:
@@ -1164,6 +1195,8 @@ _ABSENCE_TAIL = re.compile(
     re.I,
 )
 _ABSENCE_HEAD = re.compile(r"(?:нет|отсутств\w*)\s+(?:\S+\s+){0,3}$", re.I)
+_AFFIRM_HEAD = re.compile(r"(?:согласно|в\s+соответствии\s+с\w*|на\s+основании|предусмотрен\w*\s+в|установлен\w*\s+в)\s+(?:\S+\s+){0,2}$", re.I)
+_CLAUSE_END = re.compile(r"[,;:!?—–]|\.\s")
 
 
 def _is_absence_claim(text_norm: str, reference: str) -> bool:
@@ -1171,13 +1204,50 @@ def _is_absence_claim(text_norm: str, reference: str) -> bool:
     pattern = (r"(?:ст\.?|стать\w*|п\.?|пункт\w*|ч\.?|част\w*|подп\.?|подпункт\w*)\s*"
                + re.escape(reference))
     for match in re.finditer(pattern, text_norm):
-        tail = text_norm[match.end():match.end() + 90]
-        if _ABSENCE_TAIL.search(tail):
-            return True
         head = text_norm[max(0, match.start() - 70):match.start()]
         if _ABSENCE_HEAD.search(head):
             return True
+        if _AFFIRM_HEAD.search(head):
+            continue  # «согласно ст. 614 ...» - это ссылка на содержание нормы, а не вывод об её отсутствии
+        # Отсутствие должно относиться к самой ссылке: ищем его только до конца этой части фразы,
+        # иначе «ст. 614 ..., а при их отсутствии ...» ошибочно считалось выводом «статьи нет».
+        tail = _CLAUSE_END.split(text_norm[match.end():match.end() + 90], maxsplit=1)[0]
+        if _ABSENCE_TAIL.search(tail):
+            return True
     return False
+
+
+_DISPUTE = re.compile(r"ошиба\w*|ошибк\w*|неправильн\w*|неверн\w*|не\s+так|исправ\w*|на\s+самом\s+деле|"
+                      r"уверен\w*|точно\s+(?:знаю|помню)|там\s+же|а\s+не\b|перепровер\w*", re.I)
+_NEGATION_BEFORE = re.compile(r"(?:\bне|\bнет|\bа\s+не|\bвместо|\bневерн\w*|\bошибочн\w*)\W+(?:\S+\W+){0,2}$", re.I)
+
+
+def _pressure_numbers(answer_text: str, current: str, history: list[dict], hits: list[dict]) -> list[str]:
+    """Числа, которые пользователь подсказал, оспаривая прежний ответ, и с которыми модель согласилась.
+
+    Срабатывает только в диалоге, где уже был ответ ассистента, а последняя реплика его оспаривает.
+    Число из такой реплики, которого нет в выдержках, подтверждением не считается; упоминание
+    с отрицанием («не 500 000, а 450 000») допустимо."""
+    if not any(m.get("role") == "assistant" for m in history) or not _DISPUTE.search(current or ""):
+        return []
+    evidence = " ".join(f"{h['chunk'].get('text', '')}" for h in hits)
+    user_only = _numbers_in(current) - _numbers_in(evidence)
+    result = []
+    for number in user_only:
+        pattern = r"(?<!\d)" + r"[\s\u00a0]?".join(re.escape(ch) for ch in number) + r"(?!\d)"
+        for match in re.finditer(pattern, answer_text):
+            if not _NEGATION_BEFORE.search(answer_text[max(0, match.start() - 40):match.start()]):
+                result.append(number)
+                break
+    return result
+
+
+def _restore_previous_answer(history: list[dict], hits: list[dict], current: str) -> str:
+    """Прежний ответ ассистента, если все его числа подтверждаются выдержками."""
+    previous = next((m["content"] for m in reversed(history) if m.get("role") == "assistant"), "")
+    if not previous or _unsupported_numbers(previous, hits, ""):
+        return ""
+    return "Нет, по документу прежний ответ верен. " + previous.strip()
 
 
 def _article_has_unnumbered_parts(hit: dict) -> bool:
@@ -1267,8 +1337,13 @@ def _retrieve_typical_answers(question: str, examples: list[dict[str, str]], top
     scores = BM25Okapi(corpus).get_scores(query_tokens)
     query_terms = set(query_tokens)
     ranked = sorted(range(len(examples)), key=lambda i: float(scores[i]), reverse=True)
+    # Локальная оценка (scripts/eval_answers.py) задаёт EVAL_HIDE_EXAMPLE: эталон самого вопроса
+    # не должен попадать в промпт как образец, иначе оценка завышается. В сабмите не задаётся.
+    hidden = " ".join(_token_list(os.environ.get("EVAL_HIDE_EXAMPLE", "")))
     selected = []
     for idx in ranked:
+        if hidden and " ".join(corpus[idx]) == hidden:
+            continue
         overlap = len(query_terms & set(corpus[idx])) / max(1, len(query_terms))
         if float(scores[idx]) <= 0 and overlap < 0.12:
             continue
@@ -1836,8 +1911,18 @@ class LegalAgent:
                         "sources": []}
         if status in {"answered", "partial", "refused_illegal"}:
             context_text = current + " " + " ".join(m["content"] for m in history_messages)
+            pressure = _pressure_numbers(answer_text, current, history_messages, hits)
+            if pressure:
+                restored = _restore_previous_answer(history_messages, hits, current)
+                if restored:
+                    # Пользователь оспаривает ответ своим числом, модель согласилась, а документ его не
+                    # подтверждает: возвращаем прежний подтверждённый ответ вместо капитуляции.
+                    _log_request(question, top_chunk_ids, "pressure_restored", pressure)
+                    return {"answer": restored, "status": "answered",
+                            "sources": _sources_for_answer(restored, hits) or _fallback_sources(restored, hits)}
             bad_numbers = sorted(set(_unsupported_numbers(answer_text, hits, context_text))
-                                 | set(_unsupported_number_units(answer_text, hits, context_text)))
+                                 | set(_unsupported_number_units(answer_text, hits, context_text))
+                                 | set(pressure))
             if bad_numbers:
                 # Число не из документов и не из вопроса - вероятно, по памяти: судья обнуляет такой ответ.
                 _log_request(question, top_chunk_ids, "unsupported_numbers", bad_numbers)

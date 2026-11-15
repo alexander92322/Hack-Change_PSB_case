@@ -8,6 +8,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY *.py document_registry.yaml typical_answers.csv ./
 COPY backend/ ./backend/
 COPY index/ ./index/
+COPY scripts/ ./scripts/
 
 EXPOSE 8000
 CMD ["uvicorn", "backend.main:app", "--host", "0.0.0.0", "--port", "8000"]
