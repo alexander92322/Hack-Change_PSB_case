@@ -1,20 +1,19 @@
-"""Публичный контракт ассистента, общий для solution.py и HTTP API."""
+"""Публичный контракт ассистента, общий для solution.py и HTTP API.
+
+answer(question, history) -> {"answer": str, "status": str, "sources": list[dict]}
+status: answered | partial | refused_no_data | refused_offtopic | refused_illegal
+"""
 
 from __future__ import annotations
 
-from agent import LegalAgent, parse_history
+from agent import LegalAgent, get_agent, parse_history
 
 STATUSES = ("answered", "partial", "refused_no_data", "refused_offtopic", "refused_illegal")
 
-_DEFAULT_AGENT: LegalAgent | None = None
-
 
 def warmup() -> LegalAgent:
-    """Загрузить индекс один раз до запуска параллельных запросов."""
-    global _DEFAULT_AGENT
-    if _DEFAULT_AGENT is None:
-        _DEFAULT_AGENT = LegalAgent()
-    return _DEFAULT_AGENT
+    """Загрузить базу один раз до запуска параллельных запросов."""
+    return get_agent()
 
 
 def split_dialog(raw_question: str) -> tuple[str, list[dict[str, str]]]:
@@ -24,8 +23,5 @@ def split_dialog(raw_question: str) -> tuple[str, list[dict[str, str]]]:
 
 
 def answer(question: str, history: list[dict] | None = None) -> dict:
-    """Вернуть пользовательский ответ и найденные подтверждающие фрагменты.
-
-    Контракт для backend сохраняется: answer/status/sources.
-    """
+    """Вернуть пользовательский ответ и подтверждающие фрагменты. Контракт: answer/status/sources."""
     return warmup().answer(question, history)
